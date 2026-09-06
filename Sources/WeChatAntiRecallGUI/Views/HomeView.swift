@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 struct HomeView: View {
     @EnvironmentObject var state: AppState
@@ -16,11 +18,19 @@ struct HomeView: View {
 
             switch state.supportStatus {
             case .supported:
-                supportedActions
+                if state.customTipNeedsRestore {
+                    customTipResidualCard
+                } else if state.installedMode == .customTip || state.silentAvailable {
+                    supportedActions
+                } else {
+                    silentUnavailableCard
+                }
             case .unsupported(let build):
                 unsupportedCard(build: build)
             case .noWeChat:
                 noWeChatCard
+            case .failed:
+                detectionFailedCard
             case .unknown:
                 Card { ProgressView().controlSize(.small) }
             }
@@ -31,39 +41,66 @@ struct HomeView: View {
 
     private var statusCard: some View {
         Card {
-            HStack(alignment: .center, spacing: 16) {
-                Image(systemName: "message.fill")
-                    .font(.system(size: 34))
-                    .foregroundStyle(Theme.accent)
-                    .frame(width: 52, height: 52)
-                    .background(Circle().fill(Theme.accent.opacity(0.12)))
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .center, spacing: 16) {
+                    Image(systemName: "message.fill")
+                        .font(.system(size: 34))
+                        .foregroundStyle(Theme.accent)
+                        .frame(width: 52, height: 52)
+                        .background(Circle().fill(Theme.accent.opacity(0.12)))
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("微信 \(state.displayVersion)")
-                        .font(.title3.weight(.semibold))
-                    Text("构建号 \(state.displayBuild)")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("微信 \(state.displayVersion)")
+                            .font(.title3.weight(.semibold))
+                        Text("构建号 \(state.displayBuild)")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+
+                    Spacer()
+
+                    VStack(alignment: .trailing, spacing: 6) {
+                        supportPill
+                        if state.busy {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text(state.busyMessage).font(.caption).foregroundStyle(.secondary)
+                            }
+                        } else {
+                            Button {
+                                Task { await state.refresh() }
+                            } label: {
+                                Label("刷新", systemImage: "arrow.clockwise").font(.caption)
+                            }
+                            .buttonStyle(.link)
+                        }
+                    }
                 }
 
-                Spacer()
+                Divider()
 
-                VStack(alignment: .trailing, spacing: 6) {
-                    supportPill
-                    if state.busy {
-                        HStack(spacing: 6) {
-                            ProgressView().controlSize(.small)
-                            Text(state.busyMessage).font(.caption).foregroundStyle(.secondary)
-                        }
-                    } else {
-                        Button {
-                            Task { await state.refresh() }
-                        } label: {
-                            Label("刷新", systemImage: "arrow.clockwise").font(.caption)
-                        }
-                        .buttonStyle(.link)
+                HStack(alignment: .center, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("当前微信 App")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(state.appPath)
+                            .font(.caption.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                            .help(state.appPath)
                     }
+                    Spacer(minLength: 12)
+                    Button("选择…", action: chooseTargetApp)
+                        .buttonStyle(.bordered)
+                        .disabled(state.busy)
+                    Button("恢复默认") {
+                        Task { await state.resetTargetApp() }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(state.busy || state.isUsingDefaultAppPath)
                 }
             }
         }
@@ -77,6 +114,8 @@ struct HomeView: View {
             return AnyView(StatusPill(tone: .warn, text: "暂不支持", systemImage: "exclamationmark.triangle.fill"))
         case .noWeChat:
             return AnyView(StatusPill(tone: .neutral, text: "未检测到微信", systemImage: "questionmark.circle"))
+        case .failed:
+            return AnyView(StatusPill(tone: .bad, text: "检测失败", systemImage: "exclamationmark.triangle.fill"))
         case .unknown:
             return AnyView(StatusPill(tone: .neutral, text: "检测中…"))
         }
@@ -129,7 +168,7 @@ struct HomeView: View {
                 }
 
                 HStack(spacing: 12) {
-                    if state.installedMode != .customTip && state.runtimeTipSupported {
+                    if state.installedMode != .customTip && state.customTipAvailable {
                         Button("使用自定义提示") { goToCustomTip() }
                             .buttonStyle(.link)
                     }
@@ -161,6 +200,57 @@ struct HomeView: View {
     }
 
     // MARK: - Unsupported / no WeChat
+
+    private var customTipResidualCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionLabel(text: "检测到不一致的自定义提示状态")
+                Text("部分自定义提示运行时或 hook 已存在，不能直接覆盖为静默模式。请到「恢复 / 卸载」还原对应备份。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("查看高级安装指引", action: goToAdvanced)
+                    .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    private var silentUnavailableCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionLabel(text: "当前版本没有静默防撤回")
+                Text("补丁数据识别了这个微信构建，但没有提供静默防撤回所需的完整补丁点。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if state.customTipAvailable {
+                    Button("使用自定义提示", action: goToCustomTip)
+                        .buttonStyle(.borderedProminent)
+                        .tint(Theme.accent)
+                } else {
+                    Button("查看可用安装模式", action: goToAdvanced)
+                        .buttonStyle(.bordered)
+                }
+            }
+        }
+    }
+
+    private var detectionFailedCard: some View {
+        Card {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    SectionLabel(text: "未能完成检测")
+                    Text("请按上方提示处理后重新检测，或选择另一个官方微信 App。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("重新检测") { Task { await state.refresh() } }
+                    .buttonStyle(.bordered)
+                    .disabled(state.busy)
+            }
+        }
+    }
 
     private func unsupportedCard(build: String) -> some View {
         Card {
@@ -198,5 +288,21 @@ struct HomeView: View {
                     .disabled(state.busy)
             }
         }
+    }
+
+    private func chooseTargetApp() {
+        let panel = NSOpenPanel()
+        panel.title = "选择官方 macOS 微信"
+        panel.message = "请选择微信 App。本轮不支持选择多开副本。"
+        panel.prompt = "选择"
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.allowsMultipleSelection = false
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.treatsFilePackagesAsDirectories = false
+        panel.directoryURL = URL(fileURLWithPath: state.appPath).deletingLastPathComponent()
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { await state.selectTargetApp(at: url) }
     }
 }

@@ -12,6 +12,10 @@ final class TipPhraseController: ObservableObject {
     @Published var saveMessage: String?
     @Published var loadError: String?
 
+    private var targetRevision: UInt64 = 0
+    private var activeAppPath: String?
+    private var previewRevision: UInt64 = 0
+
     static let maxLength = 120
     static let defaultPhrase = "已拦截一条撤回消息"
 
@@ -28,13 +32,17 @@ final class TipPhraseController: ObservableObject {
 
     // MARK: - Load / Save
 
-    func load() async {
-        busy = true; defer { busy = false }
+    func load(appPath: String) async {
+        let revision = beginTargetOperation(appPath: appPath)
+        busy = true
         validationError = nil
         saveMessage = nil
         loadError = nil
 
-        let get = await CLIRunner.runUser(BundledPaths.cli, ["tip-phrase", "get"])
+        let get = await CLIRunner.runUser(
+            BundledPaths.cli,
+            targetedArguments(["get"], appPath: appPath))
+        guard targetOperationIsCurrent(revision, appPath: appPath) else { return }
         if get.succeeded,
            let line = get.output.split(separator: "\n").first(where: { $0.hasPrefix("Phrase: ") }) {
             phrase = String(line.dropFirst("Phrase: ".count))
@@ -48,18 +56,27 @@ final class TipPhraseController: ObservableObject {
                 fallback: "未能读取已保存的短语，当前先显示默认值。")
         }
 
-        let probe = await CLIRunner.runUser(BundledPaths.cli, ["tip-phrase", "probe", "get"])
+        let probe = await CLIRunner.runUser(
+            BundledPaths.cli,
+            targetedArguments(["probe", "get"], appPath: appPath))
+        guard targetOperationIsCurrent(revision, appPath: appPath) else { return }
         probeEnabled = probe.succeeded && probe.output.contains("enabled")
+        busy = false
         await refreshPreview()
     }
 
     @discardableResult
-    func save() async -> Bool {
+    func save(appPath: String) async -> Bool {
         validationError = validate(phrase)
         guard validationError == nil else { return false }
-        busy = true; defer { busy = false }
+        let revision = beginTargetOperation(appPath: appPath)
+        busy = true
         let trimmed = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
-        let result = await CLIRunner.runUser(BundledPaths.cli, ["tip-phrase", "set", trimmed])
+        let result = await CLIRunner.runUser(
+            BundledPaths.cli,
+            targetedArguments(["set", trimmed], appPath: appPath))
+        guard targetOperationIsCurrent(revision, appPath: appPath) else { return false }
+        busy = false
         if result.succeeded {
             loadError = nil
             saveMessage = "已保存。改完请完全退出并重开微信。"
@@ -71,13 +88,19 @@ final class TipPhraseController: ObservableObject {
         }
     }
 
-    func reset() async {
-        busy = true; defer { busy = false }
-        let result = await CLIRunner.runUser(BundledPaths.cli, ["tip-phrase", "reset"])
+    func reset(appPath: String) async {
+        let revision = beginTargetOperation(appPath: appPath)
+        busy = true
+        let result = await CLIRunner.runUser(
+            BundledPaths.cli,
+            targetedArguments(["reset"], appPath: appPath))
+        guard targetOperationIsCurrent(revision, appPath: appPath) else { return }
         if result.succeeded {
-            await load()
+            await load(appPath: appPath)
+            guard activeAppPath == appPath else { return }
             saveMessage = "已恢复默认短语。"
         } else {
+            busy = false
             validationError = accessAwareMessage(result: result, fallback: "恢复默认短语失败。")
         }
     }
@@ -85,12 +108,15 @@ final class TipPhraseController: ObservableObject {
     // MARK: - Preview (debounced by the view)
 
     func refreshPreview() async {
+        previewRevision &+= 1
+        let revision = previewRevision
         let candidate = phrase.trimmingCharacters(in: .whitespacesAndNewlines)
         guard validate(candidate) == nil else { preview = ""; return }
         let result = await CLIRunner.runUser(
             BundledPaths.cli,
             ["tip-phrase", "preview", candidate, "--from", "张三", "--message", "这是一条示例消息"]
         )
+        guard revision == previewRevision else { return }
         // Output: "Preview:\n<rendered>"
         let lines = result.output.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         if let idx = lines.firstIndex(where: { $0.hasPrefix("Preview:") }), idx + 1 < lines.count {
@@ -102,14 +128,34 @@ final class TipPhraseController: ObservableObject {
 
     // MARK: - Debug probe
 
-    func setProbe(_ enabled: Bool) async {
-        busy = true; defer { busy = false }
-        let result = await CLIRunner.runUser(BundledPaths.cli, ["tip-phrase", "probe", enabled ? "on" : "off"])
+    func setProbe(_ enabled: Bool, appPath: String) async {
+        let revision = beginTargetOperation(appPath: appPath)
+        busy = true
+        let result = await CLIRunner.runUser(
+            BundledPaths.cli,
+            targetedArguments(["probe", enabled ? "on" : "off"], appPath: appPath))
+        guard targetOperationIsCurrent(revision, appPath: appPath) else { return }
+        busy = false
         if result.succeeded {
             probeEnabled = enabled
         } else {
             validationError = accessAwareMessage(result: result, fallback: "更新调试探针失败。")
         }
+    }
+
+    private func beginTargetOperation(appPath: String) -> UInt64 {
+        targetRevision &+= 1
+        previewRevision &+= 1
+        activeAppPath = appPath
+        return targetRevision
+    }
+
+    private func targetOperationIsCurrent(_ revision: UInt64, appPath: String) -> Bool {
+        targetRevision == revision && activeAppPath == appPath
+    }
+
+    private func targetedArguments(_ arguments: [String], appPath: String) -> [String] {
+        ["tip-phrase"] + arguments + ["--app", appPath]
     }
 
     private func decodeError(_ result: CLIResult) -> String? {

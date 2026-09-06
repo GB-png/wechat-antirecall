@@ -9,33 +9,45 @@ struct DirectAppInfo {
 
 enum WeChatStatusProbe {
     static let officialBundleIDs: Set<String> = ["com.tencent.xinWeChat", "com.tencent.xin"]
-    static let cloneBundleIDPrefix = "com.tencent.xinWeChat.antirecall.clone"
-
-    private static func isWeChatIdentifier(_ id: String?) -> Bool {
-        guard let id else { return false }
-        return officialBundleIDs.contains(id) || id.hasPrefix(cloneBundleIDPrefix)
+    /// Matches the CLI's selected-app guard: only processes whose bundle or executable path
+    /// is the selected app (or lives inside it) count as running.
+    static func path(_ candidateURL: URL?, belongsToAppAt appPath: String) -> Bool {
+        guard let candidateURL else { return false }
+        let target = URL(fileURLWithPath: appPath)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+        let candidate = candidateURL
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+        let prefix = target.hasSuffix("/") ? target : target + "/"
+        return candidate == target || candidate.hasPrefix(prefix)
     }
 
-    /// Running WeChat instances (official + tool clones).
-    static func runningInstances() -> [NSRunningApplication] {
-        NSWorkspace.shared.runningApplications.filter { isWeChatIdentifier($0.bundleIdentifier) }
+    static func runningInstances(appPath: String) -> [NSRunningApplication] {
+        NSWorkspace.shared.runningApplications.filter { app in
+            path(app.bundleURL, belongsToAppAt: appPath)
+                || path(app.executableURL, belongsToAppAt: appPath)
+        }
     }
 
-    static func isRunning() -> Bool {
-        !runningInstances().isEmpty
+    static func isRunning(appPath: String) -> Bool {
+        !runningInstances(appPath: appPath).isEmpty
     }
 
-    /// Politely quit, then force-terminate any stragglers after a short grace period.
-    static func quitAll() async {
-        let running = runningInstances()
+    /// Politely quits only the selected app, then force-terminates that same target if needed.
+    static func quit(appPath: String) async {
+        let running = runningInstances(appPath: appPath)
         for app in running {
             app.terminate()
         }
-        // Give them a moment to quit gracefully.
-        for _ in 0..<20 where !runningInstances().isEmpty {
+        for _ in 0..<20 where !runningInstances(appPath: appPath).isEmpty {
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
-        for app in runningInstances() {
+        for app in runningInstances(appPath: appPath) {
             app.forceTerminate()
         }
     }

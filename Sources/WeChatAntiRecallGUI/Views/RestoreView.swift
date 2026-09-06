@@ -15,10 +15,11 @@ struct RestoreView: View {
             Card {
                 VStack(alignment: .leading, spacing: 8) {
                     SectionLabel(text: "从备份还原")
-                    Text("每次打补丁都会在被修改文件旁生成备份。选择一次备份即可把微信还原到打补丁前的状态，相当于卸载。")
+                    Text("每次打补丁都会在被修改文件旁生成备份。每个备份会还原到该次操作开始前的状态；如果后续模式叠加在更早的补丁上，可能还需继续还原对应的更早备份，才能完全回到原版微信。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    KeyValueRow(key: "当前微信 App", value: state.appPath, mono: true)
                     if state.wechatRunning {
                         HintRow(systemImage: "exclamationmark.circle.fill", text: "恢复前请先退出微信。", tint: .orange)
                     }
@@ -43,6 +44,7 @@ struct RestoreView: View {
         .onChange(of: state.busy) { busy in
             if !busy { reload() }
         }
+        .onChange(of: state.appPath) { _ in reload() }
     }
 
     private func sessionCard(_ session: BackupSession) -> some View {

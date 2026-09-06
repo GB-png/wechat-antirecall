@@ -45,6 +45,26 @@ final class CatalogSelectionTests: XCTestCase {
         XCTAssertEqual(BundledPaths.newerCatalog(invalid, valid), valid)
     }
 
+    func testRepositoryRootWalksUpFromCurrentSwiftPMProductLayout() throws {
+        let repository = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: repository) }
+
+        FileManager.default.createFile(
+            atPath: repository.appendingPathComponent("Package.swift").path,
+            contents: Data())
+        try FileManager.default.createDirectory(
+            at: repository.appendingPathComponent("Sources/WeChatAntiRecallGUI", isDirectory: true),
+            withIntermediateDirectories: true)
+        let productDirectory = repository.appendingPathComponent(
+            ".build/out/Products/Debug",
+            isDirectory: true)
+        try FileManager.default.createDirectory(at: productDirectory, withIntermediateDirectories: true)
+
+        XCTAssertEqual(
+            BundledPaths.repositoryRoot(startingAt: productDirectory),
+            repository.resolvingSymlinksInPath())
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("wechat-antirecall-catalog-tests-\(UUID().uuidString)", isDirectory: true)

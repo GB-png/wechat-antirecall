@@ -61,6 +61,59 @@ final class CloneTests: XCTestCase {
         ])
     }
 
+    func testPlannerRejectsPrefixesThatCouldEscapeOutputDirectory() throws {
+        let sourceURL = URL(fileURLWithPath: "/Applications/WeChat.app", isDirectory: true)
+        let appInfo = AppInfo(
+            appURL: sourceURL,
+            executableURL: sourceURL.appendingPathComponent("Contents/MacOS/WeChat"),
+            shortVersion: "4.1.9",
+            buildVersion: "268602",
+            bundleIdentifier: "com.tencent.xinWeChat"
+        )
+
+        for prefix in ["../escaped", "nested/name", "/tmp/absolute", ".."] {
+            let options = try CloneOptions([
+                "--output-dir", "/tmp/selected",
+                "--count", "1",
+                "--name-prefix", prefix,
+            ])
+
+            XCTAssertThrowsError(
+                try WeChatClonePlanner().plan(appInfo: appInfo, options: options),
+                "prefix should be rejected: \(prefix)"
+            ) { error in
+                XCTAssertEqual(
+                    error.localizedDescription,
+                    "--name-prefix 只能是名称，不能包含路径分隔符 / 或 \\，也不能使用 . 或 ..")
+            }
+        }
+    }
+
+    func testPlannerPreservesUnicodeAndSpacesInsideDirectChildName() throws {
+        let sourceURL = URL(fileURLWithPath: "/Applications/WeChat.app", isDirectory: true)
+        let outputURL = URL(fileURLWithPath: "/tmp/selected", isDirectory: true).standardizedFileURL
+        let appInfo = AppInfo(
+            appURL: sourceURL,
+            executableURL: sourceURL.appendingPathComponent("Contents/MacOS/WeChat"),
+            shortVersion: "4.1.9",
+            buildVersion: "268602",
+            bundleIdentifier: "com.tencent.xinWeChat"
+        )
+        let options = try CloneOptions([
+            "--output-dir", outputURL.path,
+            "--count", "1",
+            "--name-prefix", "微信 工作",
+        ])
+
+        let spec = try XCTUnwrap(WeChatClonePlanner().plan(appInfo: appInfo, options: options).first)
+
+        XCTAssertEqual(spec.displayName, "微信 工作 1")
+        XCTAssertEqual(spec.destinationURL.lastPathComponent, "微信 工作 1.app")
+        XCTAssertEqual(
+            spec.destinationURL.deletingLastPathComponent().standardizedFileURL,
+            outputURL)
+    }
+
     func testPlannerRejectsOutputDirectoryInsideSourceBundle() throws {
         let sourceURL = URL(fileURLWithPath: "/Applications/WeChat.app", isDirectory: true)
         let appInfo = AppInfo(
@@ -71,6 +124,31 @@ final class CloneTests: XCTestCase {
             bundleIdentifier: "com.tencent.xinWeChat"
         )
         let options = try CloneOptions(["--output-dir", "/Applications/WeChat.app/Contents"])
+
+        XCTAssertThrowsError(try WeChatClonePlanner().plan(appInfo: appInfo, options: options)) { error in
+            XCTAssertEqual(error.localizedDescription, "clone 输出目录不能位于源 App bundle 内")
+        }
+    }
+
+    func testPlannerRejectsSymlinkedOutputDirectoryInsideSourceBundle() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wechat-clone-symlink-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sourceURL = root.appendingPathComponent("WeChat.app", isDirectory: true)
+        let contentsURL = sourceURL.appendingPathComponent("Contents", isDirectory: true)
+        try FileManager.default.createDirectory(at: contentsURL, withIntermediateDirectories: true)
+        let outputSymlink = root.appendingPathComponent("Output", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: outputSymlink, withDestinationURL: contentsURL)
+
+        let appInfo = AppInfo(
+            appURL: sourceURL,
+            executableURL: contentsURL.appendingPathComponent("MacOS/WeChat"),
+            shortVersion: "4.1.9",
+            buildVersion: "268602",
+            bundleIdentifier: "com.tencent.xinWeChat"
+        )
+        let options = try CloneOptions(["--output-dir", outputSymlink.path])
 
         XCTAssertThrowsError(try WeChatClonePlanner().plan(appInfo: appInfo, options: options)) { error in
             XCTAssertEqual(error.localizedDescription, "clone 输出目录不能位于源 App bundle 内")

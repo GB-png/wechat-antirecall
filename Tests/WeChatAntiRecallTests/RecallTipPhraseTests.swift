@@ -131,6 +131,69 @@ final class RecallTipPhraseTests: XCTestCase {
         XCTAssertEqual(try RecallTipPhraseOptions(["probe", "off"]).action, .probe(.set(false)))
     }
 
+    func testParsesAppBeforeAndAfterTargetedCommands() throws {
+        let path = "/Applications/WeChat Beta.app"
+
+        let get = try RecallTipPhraseOptions(["--app", path, "get"])
+        XCTAssertEqual(get.action, .get)
+        XCTAssertEqual(get.appPath, path)
+
+        let set = try RecallTipPhraseOptions(["set", "alternate phrase", "--app", path])
+        XCTAssertEqual(set.action, .set(try RecallTipPhrase("alternate phrase")))
+        XCTAssertEqual(set.appPath, path)
+
+        let probe = try RecallTipPhraseOptions(["probe", "on", "--app", path])
+        XCTAssertEqual(probe.action, .probe(.set(true)))
+        XCTAssertEqual(probe.appPath, path)
+    }
+
+    func testTipPhraseAppArgumentValidation() {
+        XCTAssertThrowsError(try RecallTipPhraseOptions(["get", "--app"])) { error in
+            XCTAssertEqual(error.localizedDescription, "--app 需要一个值")
+        }
+        XCTAssertThrowsError(try RecallTipPhraseOptions([
+            "--app", "/Applications/WeChat.app",
+            "get",
+            "--app", "/Applications/Other.app",
+        ])) { error in
+            XCTAssertEqual(error.localizedDescription, "tip-phrase --app 只能指定一次")
+        }
+        XCTAssertThrowsError(try RecallTipPhraseOptions([
+            "preview", "示例", "--app", "/Applications/WeChat.app",
+        ])) { error in
+            XCTAssertEqual(error.localizedDescription, "tip-phrase preview 不接受 --app；预览与目标 App 无关")
+        }
+        XCTAssertThrowsError(try RecallTipPhraseOptions(["get", "--domain", "com.tencent.xin"])) { error in
+            XCTAssertEqual(error.localizedDescription, "tip-phrase get 不接受额外参数")
+        }
+    }
+
+    func testAlternateOfficialAppDerivesItsPreferenceDomain() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wechat-antirecall-domain-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let appURL = try makeWechatApp(in: directory, bundleIdentifier: "com.tencent.xin")
+
+        let domain = try recallTipPreferenceDomain(appPath: appURL.path)
+
+        XCTAssertEqual(domain, "com.tencent.xin")
+        let store = RecallTipPreferenceStore(homeDirectory: directory, domain: domain)
+        XCTAssertTrue(store.preferenceFileURL.path.contains("Library/Containers/com.tencent.xin/"))
+        XCTAssertEqual(try recallTipPreferenceDomain(appPath: nil), RecallTipPreferenceStore.domain)
+    }
+
+    func testPreferenceDomainRejectsPathTraversalFromMarkedClone() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wechat-antirecall-domain-tests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let appURL = try makeWechatApp(
+            in: directory,
+            bundleIdentifier: "com.tencent.xinWeChat.antirecall.clone1/../../escape",
+            cloneMarker: true)
+
+        XCTAssertThrowsError(try recallTipPreferenceDomain(appPath: appURL.path))
+    }
+
     func testRuntimeTipInstallOptionSelectsRecallTipPatch() throws {
         let options = try InstallOptions(["--runtime-tip"])
 
@@ -243,4 +306,29 @@ final class RecallTipPhraseTests: XCTestCase {
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: store.preferenceFileURL.path))
     }
+    private func makeWechatApp(
+        in directory: URL,
+        bundleIdentifier: String,
+        cloneMarker: Bool = false
+    ) throws -> URL {
+        let appURL = directory.appendingPathComponent("WeChat.app", isDirectory: true)
+        let contentsURL = appURL.appendingPathComponent("Contents", isDirectory: true)
+        try FileManager.default.createDirectory(at: contentsURL, withIntermediateDirectories: true)
+        var plist: [String: Any] = [
+            "CFBundleExecutable": "WeChat",
+            "CFBundleShortVersionString": "4.1.13",
+            "CFBundleVersion": "269624",
+            "CFBundleIdentifier": bundleIdentifier,
+        ]
+        if cloneMarker {
+            plist[WeChatCloneMetadata.markerKey] = true
+        }
+        let data = try PropertyListSerialization.data(
+            fromPropertyList: plist,
+            format: .binary,
+            options: 0)
+        try data.write(to: contentsURL.appendingPathComponent("Info.plist"))
+        return appURL
+    }
+
 }

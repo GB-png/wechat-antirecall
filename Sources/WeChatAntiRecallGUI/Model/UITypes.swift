@@ -6,6 +6,10 @@ struct GUIError: LocalizedError {
     init(_ message: String) { self.message = message }
 }
 
+enum GUICLIProtocol {
+    static let schemaVersion = 1
+}
+
 enum InstallMode: String, CaseIterable, Identifiable {
     case silent
     case customTip
@@ -63,15 +67,51 @@ enum SupportStatus: Equatable {
     case supported
     case unsupported(build: String)
     case noWeChat
+    case failed
     case unknown
 }
 
-/// Whether the default silent anti-recall is currently applied to WeChat.
+/// Whether a requested patch mode is currently applied to the selected WeChat target.
 enum InstallState: Equatable {
     case notInstalled
     case installed
     case mismatch
     case unknown
+
+    static func classify(_ report: InstallReport) -> InstallState {
+        let targetStates = report.targets.flatMap { $0.entries.map(\.state) }
+        let runtimeStates = report.runtime.map(\.state)
+        let states = targetStates + runtimeStates
+        guard !states.isEmpty else { return .mismatch }
+
+        let applied: Set<String> = ["alreadyPatched", "alreadyInjected"]
+        if states.allSatisfy(applied.contains) { return .installed }
+
+        let wouldApply: Set<String> = ["wouldPatch", "wouldInject"]
+        if states.allSatisfy(wouldApply.contains) { return .notInstalled }
+
+        return .mismatch
+    }
+}
+
+enum InstallPreflightDisposition: Equatable {
+    case invalid
+    case alreadyInstalled
+    case installable
+
+    static func classify(_ report: InstallReport) -> InstallPreflightDisposition {
+        let targetStates = report.targets.flatMap { $0.entries.map(\.state) }
+        let runtimeStates = report.runtime.map(\.state)
+        let states = targetStates + runtimeStates
+        guard !states.isEmpty else { return .invalid }
+
+        let alreadyApplied: Set<String> = ["alreadyPatched", "alreadyInjected"]
+        let wouldApply: Set<String> = ["wouldPatch", "wouldInject"]
+        guard states.allSatisfy({ alreadyApplied.contains($0) || wouldApply.contains($0) }) else {
+            return .invalid
+        }
+        return states.allSatisfy(alreadyApplied.contains) ? .alreadyInstalled : .installable
+    }
 }
 
 enum BannerKind {

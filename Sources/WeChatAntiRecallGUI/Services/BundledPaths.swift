@@ -13,23 +13,43 @@ enum BundledPaths {
         candidates.first { FileManager.default.isReadableFile(atPath: $0.path) }
     }
 
-    /// Repo-root fallbacks used only during `swift run` development.
-    private static var devRepoRoot: URL {
-        // .build/<config>/WeChatAntiRecallGUI -> repo root is 3 levels up from the binary dir.
-        URL(fileURLWithPath: CommandLine.arguments[0])
-            .deletingLastPathComponent()   // release/
-            .deletingLastPathComponent()   // arm64-apple-macosx/ or debug/
-            .deletingLastPathComponent()   // .build/
-            .deletingLastPathComponent()   // repo root
+    /// Walks upward until it finds this package's stable repository markers. SwiftPM's
+    /// product directory has changed across toolchain versions, so fixed parent counts are
+    /// deliberately avoided.
+    static func repositoryRoot(startingAt directoryURL: URL, fileManager: FileManager = .default) -> URL? {
+        var current = directoryURL.standardizedFileURL.resolvingSymlinksInPath()
+        while true {
+            let package = current.appendingPathComponent("Package.swift")
+            let sources = current.appendingPathComponent("Sources/WeChatAntiRecallGUI", isDirectory: true)
+            var sourcesIsDirectory = ObjCBool(false)
+            if fileManager.fileExists(atPath: package.path),
+               fileManager.fileExists(atPath: sources.path, isDirectory: &sourcesIsDirectory),
+               sourcesIsDirectory.boolValue {
+                return current
+            }
+
+            let parent = current.deletingLastPathComponent()
+            if parent.path == current.path { return nil }
+            current = parent
+        }
+    }
+
+    /// Repo-root fallbacks used only during direct SwiftPM development launches.
+    private static var devRepoRoot: URL? {
+        let executableDirectory = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+        return repositoryRoot(startingAt: executableDirectory)
+            ?? repositoryRoot(startingAt: URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
     }
 
     private static var devBuildDirs: [URL] {
-        let root = devRepoRoot
+        guard let root = devRepoRoot else { return [] }
         return [
-            root.appendingPathComponent(".build/release"),
             root.appendingPathComponent(".build/debug"),
-            root.appendingPathComponent(".build/arm64-apple-macosx/release"),
+            root.appendingPathComponent(".build/release"),
+            root.appendingPathComponent(".build/out/Products/Debug"),
+            root.appendingPathComponent(".build/out/Products/Release"),
             root.appendingPathComponent(".build/arm64-apple-macosx/debug"),
+            root.appendingPathComponent(".build/arm64-apple-macosx/release"),
         ]
     }
 
@@ -56,9 +76,10 @@ enum BundledPaths {
     }
 
     static var bundledPatchesJSON: URL {
-        firstReadable([resourcesURL.appendingPathComponent("patches.json"),
-                       devRepoRoot.appendingPathComponent("patches.json")])
-            ?? resourcesURL.appendingPathComponent("patches.json")
+        let developmentCatalog = devRepoRoot?.appendingPathComponent("patches.json")
+        return firstReadable(
+            [resourcesURL.appendingPathComponent("patches.json")] + [developmentCatalog].compactMap { $0 }
+        ) ?? resourcesURL.appendingPathComponent("patches.json")
     }
 
     // MARK: - Writable working directory

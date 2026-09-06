@@ -76,18 +76,46 @@ enum WeChatCloneMetadata {
 
 struct WeChatClonePlanner {
     func plan(appInfo: AppInfo, options: CloneOptions) throws -> [WeChatCloneSpec] {
-        let sourceURL = appInfo.appURL.standardizedFileURL
-        let outputURL = URL(fileURLWithPath: options.outputDir, isDirectory: true).standardizedFileURL
+        let sourceURL = appInfo.appURL
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        // Resolve every existing path component so an output-directory symlink cannot conceal
+        // that the effective destination is inside the source bundle. Foundation preserves
+        // nonexistent trailing components, so a legitimate not-yet-created output remains valid.
+        let outputURL = URL(fileURLWithPath: options.outputDir, isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
         let sourcePath = sourceURL.path
         let outputPath = outputURL.path
         if outputPath == sourcePath || outputPath.hasPrefix(sourcePath + "/") {
             throw ToolError.usage("clone 输出目录不能位于源 App bundle 内")
         }
 
+        let trimmedPrefix = options.namePrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !options.namePrefix.hasPrefix("/"),
+              !options.namePrefix.contains("/"),
+              !options.namePrefix.contains("\\"),
+              trimmedPrefix != ".",
+              trimmedPrefix != ".." else {
+            throw ToolError.usage("--name-prefix 只能是名称，不能包含路径分隔符 / 或 \\，也不能使用 . 或 ..")
+        }
+
         return try (1...options.count).map { index in
             let displayName = "\(options.namePrefix) \(index)"
-            let destinationURL = outputURL.appendingPathComponent("\(displayName).app", isDirectory: true).standardizedFileURL
+            let destinationURL = outputURL
+                .appendingPathComponent("\(displayName).app", isDirectory: true)
+                .standardizedFileURL
             let destinationPath = destinationURL.path
+            let destinationParentPath = destinationURL
+                .deletingLastPathComponent()
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+                .path
+            guard destinationParentPath == outputPath else {
+                throw ToolError.usage("clone 目标必须直接位于所选输出目录内")
+            }
             if destinationPath == sourcePath {
                 throw ToolError.usage("clone 目标不能等于源 App bundle")
             }

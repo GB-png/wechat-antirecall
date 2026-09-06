@@ -22,7 +22,7 @@ enum SourceBuildService {
     }
 
     /// git clone/pull → swift build -c release → copy artifacts into builtDir.
-    static func buildFromSource(onLine: @escaping @Sendable (String) -> Void) async throws -> BuildOutcome {
+    static func buildFromSource(appPath: String, onLine: @escaping @Sendable (String) -> Void) async throws -> BuildOutcome {
         BundledPaths.ensureWorkingDirectories()
         let fm = FileManager.default
         try? fm.createDirectory(at: builtDir, withIntermediateDirectories: true)
@@ -65,14 +65,16 @@ enum SourceBuildService {
             try fm.copyItem(at: src, to: dst)
         }
 
-        // 4) Compatibility gate. The GUI drives the CLI via its `--json` interface. If the
-        // pulled source predates that feature, the built CLI can't talk to the GUI — refuse
-        // and revert rather than shadow the working bundled CLI with a broken one.
+        // 4) Compatibility gate. A successful command, decodable report, and exact protocol
+        // version are all required before the new artifacts are allowed to shadow the bundle.
         onLine(">> 校验构建产物是否兼容 GUI…")
-        let probe = await run(cliDst.path, ["versions", "--json", "--app", "/Applications/WeChat.app", "--config", patchesDst.path])
-        guard (probe.output + probe.error).contains("schemaVersion") else {
+        let probe = await run(cliDst.path, ["versions", "--json", "--app", appPath, "--config", patchesDst.path])
+        let report = try? JSONDecoder().decode(VersionsReport.self, from: Data(probe.output.utf8))
+        guard probe.exitCode == 0,
+              let report,
+              report.schemaVersion == GUICLIProtocol.schemaVersion else {
             try? fm.removeItem(at: builtDir)
-            throw GUIError("源码（commit \(commit)）还没有 GUI 需要的 --json 接口，可能改动尚未合入 main。已回退到内置工具，等改动合入后再试。")
+            throw GUIError("源码（commit \(commit)）的命令行接口与当前 GUI 不兼容，或无法读取所选微信。已回退到内置工具，请查看日志。")
         }
 
         onLine(">> 完成：已切换到源码构建的工具（commit \(commit)）")

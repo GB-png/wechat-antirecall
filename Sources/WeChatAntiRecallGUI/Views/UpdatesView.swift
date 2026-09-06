@@ -4,6 +4,7 @@ import AppKit
 struct UpdatesView: View {
     @EnvironmentObject var state: AppState
     @State private var release: ReleaseInfo?
+    @State private var comparison: AppVersionComparison?
     @State private var checkingRelease = false
     @State private var releaseError: String?
 
@@ -66,11 +67,16 @@ struct UpdatesView: View {
                     .font(.callout).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
+                KeyValueRow(key: "当前版本", value: UpdateService.installedAppVersion.displayText)
                 if let release {
-                    KeyValueRow(key: "最新发布", value: "\(release.name) (\(release.tag))")
+                    KeyValueRow(key: "最新发布", value: releaseDisplayText(release))
                 }
+                comparisonStatus
                 if let releaseError {
-                    HintRow(systemImage: "exclamationmark.triangle", text: releaseError, tint: .orange)
+                    HintRow(
+                        systemImage: "wifi.exclamationmark",
+                        text: "无法检查更新：\(releaseError)",
+                        tint: .orange)
                 }
 
                 HStack {
@@ -85,9 +91,10 @@ struct UpdatesView: View {
                     .buttonStyle(.bordered)
                     .disabled(checkingRelease)
 
-                    if let release {
-                        Button("打开下载页") { NSWorkspace.shared.open(release.htmlURL) }
-                            .buttonStyle(.bordered)
+                    if updateIsAvailable, let release {
+                        Button("下载新版本") { NSWorkspace.shared.open(release.htmlURL) }
+                            .buttonStyle(.borderedProminent)
+                            .tint(Theme.accent)
                     }
                 }
             }
@@ -140,15 +147,78 @@ struct UpdatesView: View {
         .onAppear { Task { await state.checkToolchain() } }
     }
 
+    @ViewBuilder
+    private var comparisonStatus: some View {
+        if let comparison {
+            switch comparison {
+            case .updateAvailable(_, let latest):
+                HintRow(
+                    systemImage: "arrow.down.circle.fill",
+                    text: "发现新版本 \(latest)，可前往下载。",
+                    tint: Theme.accent)
+            case .upToDate:
+                HintRow(
+                    systemImage: "checkmark.circle.fill",
+                    text: "当前已是最新发布版本。",
+                    tint: Theme.accent)
+            case .localNewer(let current, let latest):
+                HintRow(
+                    systemImage: "hammer.fill",
+                    text: "本机版本 \(current) 比最新发布 \(latest) 更新，可能是本地开发构建。",
+                    tint: .blue)
+            case .unableToCompare(let reason):
+                switch reason {
+                case .developmentBuild:
+                    HintRow(
+                        systemImage: "hammer",
+                        text: "当前为直接运行的开发构建，没有可比较的应用版本号；仍可查看最新发布。",
+                        tint: .orange)
+                case .malformedCurrent(let value):
+                    HintRow(
+                        systemImage: "exclamationmark.triangle",
+                        text: "当前版本“\(value)”不是可比较的数字版本（例如 1.10.0）。",
+                        tint: .orange)
+                case .malformedLatest(let value):
+                    HintRow(
+                        systemImage: "exclamationmark.triangle",
+                        text: "最新发布标签“\(value)”不是可比较的数字版本，无法判断是否需要更新。",
+                        tint: .orange)
+                }
+            }
+        }
+    }
+
+    private var updateIsAvailable: Bool {
+        guard let comparison else { return false }
+        if case .updateAvailable = comparison { return true }
+        return false
+    }
+
+    private func releaseDisplayText(_ release: ReleaseInfo) -> String {
+        release.name == release.tag ? release.tag : "\(release.name) (\(release.tag))"
+    }
+
     private func checkRelease() {
         checkingRelease = true
+        release = nil
+        comparison = nil
         releaseError = nil
         Task {
             do {
                 let info = try await UpdateService.checkLatestRelease()
-                await MainActor.run { self.release = info; self.checkingRelease = false }
+                let result = AppVersionComparison.evaluate(
+                    current: UpdateService.installedAppVersion,
+                    latestTag: info.tag)
+                await MainActor.run {
+                    self.release = info
+                    self.comparison = result
+                    self.checkingRelease = false
+                }
             } catch {
-                await MainActor.run { self.releaseError = error.localizedDescription; self.checkingRelease = false }
+                await MainActor.run {
+                    self.releaseError = error.localizedDescription
+                    self.checkingRelease = false
+                }
             }
         }
     }

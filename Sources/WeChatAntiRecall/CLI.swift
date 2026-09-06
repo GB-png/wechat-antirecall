@@ -302,11 +302,15 @@ enum RecallTipProbeAction: Equatable {
 
 struct RecallTipPhraseOptions {
     let action: RecallTipPhraseAction
+    let appPath: String?
 
     init(_ arguments: [String]) throws {
-        var parser = ArgumentCursor(arguments)
+        let extracted = try Self.extractAppPath(from: arguments)
+        appPath = extracted.appPath
+
+        var parser = ArgumentCursor(extracted.arguments)
         guard let command = parser.next() else {
-            throw ToolError.usage("tip-phrase 需要 get、set、reset 或 preview")
+            throw ToolError.usage("tip-phrase 需要 get、set、reset、preview 或 probe")
         }
 
         switch command {
@@ -327,6 +331,9 @@ struct RecallTipPhraseOptions {
             }
             action = .reset
         case "preview":
+            guard appPath == nil else {
+                throw ToolError.usage("tip-phrase preview 不接受 --app；预览与目标 App 无关")
+            }
             let phrase = try RecallTipPhrase(parser.requiredValue(after: "preview"))
             var senderName: String?
             var messageKind = "文本消息"
@@ -372,6 +379,31 @@ struct RecallTipPhraseOptions {
         default:
             throw ToolError.usage("未知 tip-phrase 命令：\(command)")
         }
+    }
+
+    private static func extractAppPath(from arguments: [String]) throws -> (arguments: [String], appPath: String?) {
+        var filtered: [String] = []
+        var appPath: String?
+        var index = 0
+
+        while index < arguments.count {
+            let argument = arguments[index]
+            if argument == "--app" {
+                guard appPath == nil else {
+                    throw ToolError.usage("tip-phrase --app 只能指定一次")
+                }
+                index += 1
+                guard index < arguments.count, !arguments[index].hasPrefix("--") else {
+                    throw ToolError.usage("--app 需要一个值")
+                }
+                appPath = arguments[index]
+            } else {
+                filtered.append(argument)
+            }
+            index += 1
+        }
+
+        return (filtered, appPath)
     }
 }
 
@@ -739,25 +771,27 @@ struct CLI {
 
     private func tipPhrase(_ arguments: [String]) throws {
         let options = try RecallTipPhraseOptions(arguments)
-        let store = RecallTipPreferenceStore()
+        let domain = try recallTipPreferenceDomain(appPath: options.appPath)
+        let store = RecallTipPreferenceStore(domain: domain)
 
         switch options.action {
         case .get:
             let phrase = try store.load() ?? .default
-            print("Domain: \(RecallTipPreferenceStore.domain)")
+            print("Domain: \(domain)")
             print("Key: \(RecallTipPreferenceStore.key)")
             print("File: \(store.preferenceFileURL.path)")
             print("Phrase: \(phrase.text)")
         case .set(let phrase):
             try store.save(phrase)
             print("Saved recall tip phrase.")
-            print("Domain: \(RecallTipPreferenceStore.domain)")
+            print("Domain: \(domain)")
             print("Key: \(RecallTipPreferenceStore.key)")
             print("File: \(store.preferenceFileURL.path)")
             printPreview(phrase: phrase, senderName: "张三", messageKind: "文本消息", messageText: "这是一条示例消息")
         case .reset:
             try store.reset()
             print("Reset recall tip phrase to default.")
+            print("Domain: \(domain)")
             print("File: \(store.preferenceFileURL.path)")
             printPreview(phrase: .default, senderName: "张三", messageKind: "文本消息", messageText: "这是一条示例消息")
         case .preview(let phrase, let senderName, let messageKind, let messageText):
@@ -766,10 +800,12 @@ struct CLI {
             switch action {
             case .get:
                 print("Debug probe: \(try store.isProbeEnabled() ? "enabled" : "disabled")")
+                print("Domain: \(domain)")
                 print("File: \(store.preferenceFileURL.path)")
             case .set(let enabled):
                 try store.setProbeEnabled(enabled)
                 print("Debug probe: \(enabled ? "enabled" : "disabled")")
+                print("Domain: \(domain)")
                 print("File: \(store.preferenceFileURL.path)")
                 if enabled {
                     print("Warning: probe logs revoke metadata and XML previews to macOS Console. Turn it off after collecting evidence.")
@@ -865,11 +901,11 @@ struct CLI {
           wechat-antirecall install  [--app /Applications/WeChat.app] [--config patches.json] [--with-tip (deprecated, prefer --runtime-tip)] [--runtime-tip] [--runtime-dylib <path>] [--multi-instance] [--block-update] [--update-only] [--dry-run] [--no-backup] [--skip-resign] [--json]
           wechat-antirecall clone    [--app /Applications/WeChat.app] [--output-dir /Applications] [--count 2] [--name-prefix WeChat] [--keep-url-schemes] [--replace] [--dry-run] [--skip-resign] [--json]
           wechat-antirecall restore  --backup <path> [--binary Contents/MacOS/WeChat] [--app /Applications/WeChat.app] [--skip-resign]
-          wechat-antirecall tip-phrase get
-          wechat-antirecall tip-phrase set <phrase>
-          wechat-antirecall tip-phrase reset
+          wechat-antirecall tip-phrase get [--app /Applications/WeChat.app]
+          wechat-antirecall tip-phrase set <phrase> [--app /Applications/WeChat.app]
+          wechat-antirecall tip-phrase reset [--app /Applications/WeChat.app]
           wechat-antirecall tip-phrase preview <phrase> [--from <name>] [--type <kind>] [--message <text>]
-          wechat-antirecall tip-phrase probe get|on|off
+          wechat-antirecall tip-phrase probe get|on|off [--app /Applications/WeChat.app]
 
         Notes:
           install only patches versions present in patches.json.
@@ -1588,6 +1624,22 @@ private func resolveConfigURL(path: String?) throws -> URL {
     throw ToolError.invalidConfig("找不到 patches.json，请使用 --config 指定路径")
 }
 
+func recallTipPreferenceDomain(appPath: String?) throws -> String {
+    guard let appPath else { return RecallTipPreferenceStore.domain }
+    return try readAppInfo(appPath: appPath).bundleIdentifier
+}
+
+private func isSafePreferenceDomain(_ domain: String) -> Bool {
+    let components = domain.split(separator: ".", omittingEmptySubsequences: false)
+    guard !components.isEmpty, components.allSatisfy({ !$0.isEmpty }) else { return false }
+    return domain.unicodeScalars.allSatisfy { scalar in
+        let value = scalar.value
+        let isASCIILetter = (65...90).contains(value) || (97...122).contains(value)
+        let isDigit = (48...57).contains(value)
+        return isASCIILetter || isDigit || scalar == "." || scalar == "-"
+    }
+}
+
 private func readAppInfo(appPath: String) throws -> AppInfo {
     let appURL = URL(fileURLWithPath: appPath)
     var isDirectory = ObjCBool(false)
@@ -1613,6 +1665,9 @@ private func readAppInfo(appPath: String) throws -> AppInfo {
     }
     guard let bundleIdentifier = plist["CFBundleIdentifier"] as? String else {
         throw ToolError.appInfoMissing("CFBundleIdentifier")
+    }
+    guard isSafePreferenceDomain(bundleIdentifier) else {
+        throw ToolError.notAWechatApp(appPath)
     }
     let isOfficialWechat = bundleIdentifier == "com.tencent.xinWeChat" || bundleIdentifier == "com.tencent.xin"
     let isToolClone = WeChatCloneMetadata.isAcceptedClone(plist: plist, bundleIdentifier: bundleIdentifier)
@@ -1685,8 +1740,7 @@ private func ensureAppNotRunning(appInfo: AppInfo, dryRun: Bool) throws {
         return
     }
 
-    let appPath = appInfo.appURL.standardizedFileURL.path
-    let appPrefix = appPath.hasSuffix("/") ? appPath : "\(appPath)/"
+    let appURL = appInfo.appURL
     let process = Process()
     let pipe = Pipe()
     process.executableURL = URL(fileURLWithPath: "/bin/ps")
@@ -1710,7 +1764,7 @@ private func ensureAppNotRunning(appInfo: AppInfo, dryRun: Bool) throws {
 
         let pid = String(trimmed[..<separator])
         let command = String(trimmed[separator...]).trimmingCharacters(in: .whitespaces)
-        if command == appPath || command.hasPrefix(appPrefix) {
+        if processExecutablePath(command, belongsToAppAt: appURL) {
             return pid
         }
         return nil
@@ -1719,6 +1773,21 @@ private func ensureAppNotRunning(appInfo: AppInfo, dryRun: Bool) throws {
     if !runningPIDs.isEmpty {
         throw ToolError.appIsRunning(path: appInfo.appURL.path, pids: runningPIDs)
     }
+}
+
+func processExecutablePath(_ candidatePath: String, belongsToAppAt appURL: URL) -> Bool {
+    let appPath = appURL
+        .standardizedFileURL
+        .resolvingSymlinksInPath()
+        .standardizedFileURL
+        .path
+    let candidate = URL(fileURLWithPath: candidatePath)
+        .standardizedFileURL
+        .resolvingSymlinksInPath()
+        .standardizedFileURL
+        .path
+    let appPrefix = appPath.hasSuffix("/") ? appPath : "\(appPath)/"
+    return candidate == appPath || candidate.hasPrefix(appPrefix)
 }
 
 private func requireWritable(_ url: URL, operation: String) throws {

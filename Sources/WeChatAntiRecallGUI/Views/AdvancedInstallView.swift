@@ -9,13 +9,19 @@ struct AdvancedInstallView: View {
     var goToRestore: () -> Void
 
     private var request: InstallRequest {
-        InstallRequest(mode: mode, blockUpdate: blockUpdate, multiInstance: multiInstance)
+        InstallRequest(
+            mode: mode,
+            blockUpdate: mode != .updateOnly && blockUpdate && canBlockUpdate,
+            multiInstance: mode != .updateOnly && multiInstance && canMultiInstance)
     }
 
     private var features: VersionsReport.Features? { state.versions?.features }
     private var supported: Bool { if case .supported = state.supportStatus { return true } else { return false } }
-    private var modeAvailable: Bool { mode != .customTip || state.runtimeTipSupported }
-    private var requiresRestore: Bool { state.installedMode == .customTip && mode == .silent }
+    private var modeAvailable: Bool { state.isInstallModeAvailable(mode) }
+    private var requiresRestore: Bool {
+        state.customTipNeedsRestore
+            || (state.installedMode == .customTip && mode == .silent)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.gap) {
@@ -44,7 +50,7 @@ struct AdvancedInstallView: View {
             VStack(alignment: .leading, spacing: 12) {
                 SectionLabel(text: "模式")
                 ForEach(InstallMode.allCases) { m in
-                    let disabled = (m == .customTip && !state.runtimeTipSupported)
+                    let disabled = !state.isInstallModeAvailable(m)
                     Button {
                         if !disabled { mode = m }
                     } label: {
@@ -57,8 +63,11 @@ struct AdvancedInstallView: View {
                                     if state.installedMode == m {
                                         StatusPill(tone: .good, text: "当前模式", systemImage: "checkmark.circle.fill")
                                     }
+                                    if m == .updateOnly {
+                                        updateBlockStatusPill
+                                    }
                                 }
-                                Text(disabled ? "当前版本不支持自定义提示（需要新的应用更新，不是拉数据能解决）" : m.subtitle)
+                                Text(disabled ? unavailableReason(for: m) : m.subtitle)
                                     .font(.caption).foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
@@ -110,7 +119,7 @@ struct AdvancedInstallView: View {
                     HStack(alignment: .top) {
                         HintRow(
                             systemImage: "arrow.uturn.backward.circle.fill",
-                            text: "从「自定义提示」切回「静默防撤回」前，需先还原备份，避免留下运行时 hook。",
+                            text: restoreRequirementText,
                             tint: .orange)
                         Button("前往恢复") { goToRestore() }
                             .buttonStyle(.bordered)
@@ -139,11 +148,45 @@ struct AdvancedInstallView: View {
                         Text(state.busyMessage).font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                HintRow(systemImage: "info.circle", text: "安装会重新签名微信并弹出一次管理员密码。装完请完全退出并重开微信，并做一次撤回实测。")
+                HintRow(systemImage: "info.circle", text: "安装会重新签名微信；仅当所选 App 无法直接写入时才会请求管理员密码。装完请完全退出并重开微信，并做一次撤回实测。")
             }
         }
     }
 
-    private var canBlockUpdate: Bool { features?.blockUpdate ?? false }
+    private var canBlockUpdate: Bool { state.updateOnlyAvailable }
     private var canMultiInstance: Bool { features?.multiInstance ?? false }
+
+    private func unavailableReason(for candidate: InstallMode) -> String {
+        switch candidate {
+        case .customTip:
+            return "当前版本未同时提供自定义提示所需的运行时和提示补丁"
+        case .updateOnly:
+            return "当前版本没有可用的屏蔽更新补丁点"
+        case .silent:
+            return "当前版本没有可用的静默防撤回补丁点"
+        }
+    }
+
+    private var restoreRequirementText: String {
+        if state.customTipNeedsRestore {
+            return "检测到不完整或混合的自定义提示状态。还原对应备份前不能检查或安装任何模式。"
+        }
+        return "从「自定义提示」切回「静默防撤回」前，需先还原备份，避免留下运行时 hook。"
+    }
+
+    private var updateBlockStatusPill: some View {
+        if !canBlockUpdate {
+            return AnyView(StatusPill(tone: .neutral, text: "当前版本不可用"))
+        }
+        switch state.updateBlockState {
+        case .installed:
+            return AnyView(StatusPill(tone: .good, text: "已安装", systemImage: "checkmark.circle.fill"))
+        case .notInstalled:
+            return AnyView(StatusPill(tone: .neutral, text: "未安装"))
+        case .mismatch:
+            return AnyView(StatusPill(tone: .warn, text: "状态异常", systemImage: "exclamationmark.triangle.fill"))
+        case .unknown:
+            return AnyView(StatusPill(tone: .neutral, text: "状态未知"))
+        }
+    }
 }

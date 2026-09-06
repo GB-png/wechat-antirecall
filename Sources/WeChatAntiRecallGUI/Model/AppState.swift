@@ -3,15 +3,20 @@ import SwiftUI
 
 @MainActor
 final class AppState: ObservableObject {
+    static let defaultAppPath = "/Applications/WeChat.app"
+    private static let selectedAppPathKey = "selectedWeChatAppPath"
+
     // Target
-    @Published var appPath: String = "/Applications/WeChat.app"
+    @Published private(set) var appPath: String
 
     // Status
     @Published var versions: VersionsReport?
     @Published var directInfo: DirectAppInfo?
     @Published var supportStatus: SupportStatus = .unknown
     @Published var installState: InstallState = .unknown
+    @Published var updateBlockState: InstallState = .unknown
     @Published var installedMode: InstallMode?
+    @Published var customTipNeedsRestore: Bool = false
     @Published var wechatRunning: Bool = false
 
     // Activity
@@ -21,6 +26,19 @@ final class AppState: ObservableObject {
     @Published var logLines: [String] = []
 
     private var runningPoll: Task<Void, Never>?
+    private let defaults: UserDefaults
+    private var statusRevision: UInt64 = 0
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        if let saved = defaults.string(forKey: Self.selectedAppPathKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !saved.isEmpty {
+            appPath = saved
+        } else {
+            appPath = Self.defaultAppPath
+        }
+    }
 
     // MARK: - Lifecycle
 
@@ -34,8 +52,8 @@ final class AppState: ObservableObject {
         runningPoll?.cancel()
         runningPoll = Task { [weak self] in
             while !Task.isCancelled {
-                let running = WeChatStatusProbe.isRunning()
-                await MainActor.run { self?.wechatRunning = running }
+                guard let self else { return }
+                wechatRunning = WeChatStatusProbe.isRunning(appPath: appPath)
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
@@ -52,93 +70,344 @@ final class AppState: ObservableObject {
     }
 
     var runtimeTipSupported: Bool { versions?.runtimeTipSupported ?? false }
+    var silentAvailable: Bool { versions?.features.silent ?? false }
+    var customTipAvailable: Bool {
+        guard let versions else { return false }
+        return versions.runtimeTipSupported && versions.features.customTip && versions.features.tip
+    }
+    var updateOnlyAvailable: Bool { versions?.features.blockUpdate ?? false }
+
+    func isInstallModeAvailable(_ mode: InstallMode) -> Bool {
+        switch mode {
+        case .silent:
+            return silentAvailable
+        case .customTip:
+            return customTipAvailable
+        case .updateOnly:
+            return updateOnlyAvailable
+        }
+    }
 
     var effectiveCatalogSourceIsDownloaded: Bool { BundledPaths.usingDownloadedCatalog }
 
+    var isUsingDefaultAppPath: Bool {
+        URL(fileURLWithPath: appPath).standardizedFileURL.path
+            == URL(fileURLWithPath: Self.defaultAppPath).standardizedFileURL.path
+    }
+
+    private func beginStatusRequest() -> UInt64 {
+        statusRevision &+= 1
+        return statusRevision
+    }
+
+    private func statusRequestIsCurrent(_ revision: UInt64, appPath expectedPath: String) -> Bool {
+        statusRevision == revision && appPath == expectedPath
+    }
+
+    func selectTargetApp(at url: URL) async {
+        guard !busy else { return }
+        busy = true
+        busyMessage = "正在验证所选微信…"
+        banner = nil
+        defer {
+            busy = false
+            busyMessage = ""
+        }
+
+        let candidate = url.standardizedFileURL.path
+        guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame,
+              WeChatStatusProbe.appExists(at: candidate),
+              let info = WeChatStatusProbe.readInfo(appPath: candidate) else {
+            banner = Banner(
+                kind: .error,
+                title: "无法选择此 App",
+                message: "请选择一个完整、可读取的 macOS 微信 App。")
+            return
+        }
+        guard WeChatStatusProbe.officialBundleIDs.contains(info.bundleIdentifier) else {
+            banner = Banner(
+                kind: .error,
+                title: "不是官方微信",
+                message: "本轮目标选择仅支持官方 macOS 微信（com.tencent.xinWeChat / com.tencent.xin）。多开副本不会作为补丁安装或备份恢复目标。")
+            return
+        }
+
+        do {
+            let report = try await versionsReport(appPath: candidate)
+            let snapshot = try await statusSnapshot(for: report, appPath: candidate)
+
+            _ = beginStatusRequest()
+            appPath = candidate
+            defaults.set(candidate, forKey: Self.selectedAppPathKey)
+            apply(report, snapshot: snapshot)
+            wechatRunning = WeChatStatusProbe.isRunning(appPath: candidate)
+        } catch {
+            banner = Banner(kind: .error, title: "无法使用所选微信", message: error.localizedDescription)
+        }
+    }
+
+    func resetTargetApp() async {
+        guard !busy else { return }
+        busy = true
+        busyMessage = "正在恢复默认微信…"
+        _ = beginStatusRequest()
+        appPath = Self.defaultAppPath
+        defaults.removeObject(forKey: Self.selectedAppPathKey)
+        await refresh()
+        busy = false
+        busyMessage = ""
+    }
+
     // MARK: - Refresh
 
-    func refresh() async {
-        wechatRunning = WeChatStatusProbe.isRunning()
-
-        let configURL = BundledPaths.effectivePatchesJSON
-        let result = await CLIRunner.runUser(BundledPaths.cli, [
-            "versions", "--app", appPath, "--config", configURL.path, "--json",
-        ])
-
-        if result.exitCode == 0, let report = try? JSONDecoder().decode(VersionsReport.self, from: Data(result.output.utf8)) {
-            versions = report
-            directInfo = nil
-            supportStatus = report.supported ? .supported : .unsupported(build: report.app.installedBuild)
-            await computeInstallState()
-        } else {
-            versions = nil
-            // Fall back to a direct Info.plist read so we can still show something.
-            if WeChatStatusProbe.appExists(at: appPath) {
-                directInfo = WeChatStatusProbe.readInfo(appPath: appPath)
-                supportStatus = directInfo == nil ? .noWeChat : .unsupported(build: directInfo?.installedBuild ?? "—")
-            } else {
-                directInfo = nil
-                supportStatus = .noWeChat
-            }
-            installState = .unknown
-            installedMode = nil
-        }
-    }
-
-    /// Uses unprivileged dry-runs to distinguish the two mutually exclusive anti-recall modes.
-    /// Checking the custom runtime first is important: its first byte patch intentionally
-    /// restores the silent-mode branch, so a silent-only probe would otherwise report it as
-    /// merely "not installed" and the home page would show the wrong mode.
-    private func computeInstallState() async {
-        guard case .supported = supportStatus else {
-            installState = .unknown
-            installedMode = nil
-            return
-        }
-
+    func refresh(preserveBanner: Bool = false) async {
+        let targetPath = appPath
+        let revision = beginStatusRequest()
+        if !preserveBanner { banner = nil }
+        supportStatus = .unknown
+        versions = nil
+        directInfo = nil
+        installState = .unknown
+        updateBlockState = .unknown
         installedMode = nil
+        customTipNeedsRestore = false
+        wechatRunning = WeChatStatusProbe.isRunning(appPath: targetPath)
 
-        if runtimeTipSupported,
-           let customReport = await dryRunReport(for: InstallRequest(mode: .customTip)),
-           customReport.allEntriesClean,
-           customReport.alreadyApplied {
-            installState = .installed
-            installedMode = .customTip
-            return
-        }
-
-        guard let silentReport = await dryRunReport(for: InstallRequest(mode: .silent)) else {
+        guard WeChatStatusProbe.appExists(at: targetPath) else {
+            versions = nil
+            directInfo = nil
+            supportStatus = .noWeChat
             installState = .unknown
+            updateBlockState = .unknown
+            installedMode = nil
+            customTipNeedsRestore = false
             return
         }
-        if !silentReport.allEntriesClean {
-            installState = .mismatch
-        } else if silentReport.alreadyApplied {
-            installState = .installed
-            installedMode = .silent
-        } else {
-            installState = .notInstalled
+
+        guard let info = WeChatStatusProbe.readInfo(appPath: targetPath) else {
+            versions = nil
+            directInfo = nil
+            supportStatus = .failed
+            installState = .unknown
+            updateBlockState = .unknown
+            installedMode = nil
+            customTipNeedsRestore = false
+            banner = Banner(
+                kind: .error,
+                title: "无法读取所选 App",
+                message: "所选路径存在，但不是完整、可读取的 macOS App。请在首页重新选择官方微信。")
+            return
+        }
+
+        directInfo = info
+        guard WeChatStatusProbe.officialBundleIDs.contains(info.bundleIdentifier) else {
+            versions = nil
+            supportStatus = .failed
+            installState = .unknown
+            updateBlockState = .unknown
+            installedMode = nil
+            customTipNeedsRestore = false
+            banner = Banner(
+                kind: .error,
+                title: "所选 App 不是官方微信",
+                message: "请在首页重新选择官方 macOS 微信。本轮不会对多开副本执行安装或恢复。")
+            return
+        }
+
+        do {
+            let report = try await versionsReport(appPath: targetPath)
+            let snapshot = try await statusSnapshot(for: report, appPath: targetPath)
+            guard statusRequestIsCurrent(revision, appPath: targetPath) else { return }
+            apply(report, snapshot: snapshot)
+        } catch {
+            guard statusRequestIsCurrent(revision, appPath: targetPath) else { return }
+            versions = nil
+            directInfo = info
+            supportStatus = .failed
+            installState = .unknown
+            updateBlockState = .unknown
+            installedMode = nil
+            customTipNeedsRestore = false
+            banner = Banner(
+                kind: .error,
+                title: "检测失败",
+                message: "\(error.localizedDescription) 请确认 App 文件完整；若问题持续，请重新安装本工具并查看下方日志。")
         }
     }
 
-    private func dryRunReport(for request: InstallRequest) async -> InstallReport? {
+    private struct StatusSnapshot {
+        let supportStatus: SupportStatus
+        let installState: InstallState
+        let updateBlockState: InstallState
+        let installedMode: InstallMode?
+        let customTipNeedsRestore: Bool
+    }
+
+    private func apply(_ report: VersionsReport, snapshot: StatusSnapshot) {
+        versions = report
+        directInfo = nil
+        supportStatus = snapshot.supportStatus
+        installState = snapshot.installState
+        updateBlockState = snapshot.updateBlockState
+        installedMode = snapshot.installedMode
+        customTipNeedsRestore = snapshot.customTipNeedsRestore
+    }
+
+    /// Uses unprivileged dry-runs to distinguish the mutually exclusive anti-recall modes
+    /// and independently determine whether the automatic-update patch is installed.
+    private func statusSnapshot(for report: VersionsReport, appPath: String) async throws -> StatusSnapshot {
+        guard report.supported else {
+            return StatusSnapshot(
+                supportStatus: .unsupported(build: report.app.installedBuild),
+                installState: .unknown,
+                updateBlockState: .unknown,
+                installedMode: nil,
+                customTipNeedsRestore: false)
+        }
+
+        var antiRecallState = InstallState.unknown
+        var mode: InstallMode?
+        var customTipNeedsRestore = false
+        let customAvailable = report.runtimeTipSupported
+            && report.features.customTip
+            && report.features.tip
+
+        if customAvailable {
+            let customState = try await dryRunProbe(
+                for: InstallRequest(mode: .customTip),
+                appPath: appPath
+            ).installState
+            switch customState {
+            case .installed:
+                antiRecallState = .installed
+                mode = .customTip
+            case .mismatch:
+                antiRecallState = .mismatch
+                customTipNeedsRestore = true
+            case .notInstalled, .unknown:
+                break
+            }
+        }
+
+        if antiRecallState == .unknown && report.features.silent {
+            let silentProbe = try await dryRunProbe(
+                for: InstallRequest(mode: .silent),
+                appPath: appPath)
+            antiRecallState = silentProbe.installState
+            if antiRecallState == .installed {
+                mode = .silent
+            }
+        }
+
+        let updateState: InstallState
+        if report.features.blockUpdate {
+            updateState = try await dryRunProbe(
+                for: InstallRequest(mode: .updateOnly),
+                appPath: appPath
+            ).installState
+        } else {
+            updateState = .unknown
+        }
+
+        return StatusSnapshot(
+            supportStatus: .supported,
+            installState: antiRecallState,
+            updateBlockState: updateState,
+            installedMode: mode,
+            customTipNeedsRestore: customTipNeedsRestore)
+    }
+
+    private enum InstallProbe {
+        case report(InstallReport)
+        case mismatch
+
+        var installState: InstallState {
+            switch self {
+            case .mismatch:
+                return .mismatch
+            case .report(let report):
+                return InstallState.classify(report)
+            }
+        }
+    }
+
+    private func dryRunProbe(for request: InstallRequest, appPath: String) async throws -> InstallProbe {
         let args = request.arguments(
             appPath: appPath,
             configURL: BundledPaths.effectivePatchesJSON,
             runtimeDylibURL: BundledPaths.runtimeDylib,
             dryRun: true)
         let result = await CLIRunner.runUser(BundledPaths.cli, args)
-        guard result.exitCode == 0 else { return nil }
-        return try? JSONDecoder().decode(InstallReport.self, from: Data(result.output.utf8))
+        if result.exitCode != 0 {
+            if let envelope = try? JSONDecoder().decode(CLIErrorEnvelope.self, from: Data(result.output.utf8)) {
+                try requireSupportedSchema(envelope.schemaVersion)
+                if envelope.error.kind == "bytesMismatch" { return .mismatch }
+                throw GUIError(envelope.error.message)
+            }
+            throw GUIError(commandFailureMessage(result, operation: "检查补丁状态"))
+        }
+        return .report(try decodeInstallReport(result.output))
+    }
+
+    private func versionsReport(appPath: String) async throws -> VersionsReport {
+        let cliURL = BundledPaths.cli
+        guard FileManager.default.isExecutableFile(atPath: cliURL.path) else {
+            throw GUIError("找不到可执行的内置命令行工具：\(cliURL.path)。")
+        }
+        let configURL = BundledPaths.effectivePatchesJSON
+        guard BundledPaths.isValidCatalog(configURL) else {
+            throw GUIError("补丁数据不可读取或格式无效：\(configURL.path)。")
+        }
+
+        let result = await CLIRunner.runUser(cliURL, [
+            "versions", "--app", appPath, "--config", configURL.path, "--json",
+        ])
+        guard result.exitCode == 0 else {
+            if let envelope = try? JSONDecoder().decode(CLIErrorEnvelope.self, from: Data(result.output.utf8)) {
+                try requireSupportedSchema(envelope.schemaVersion)
+                throw GUIError(envelope.error.message)
+            }
+            throw GUIError(commandFailureMessage(result, operation: "读取微信版本"))
+        }
+        guard let report = try? JSONDecoder().decode(VersionsReport.self, from: Data(result.output.utf8)) else {
+            throw GUIError("命令行工具返回了无法解析的版本信息。")
+        }
+        try requireSupportedSchema(report.schemaVersion)
+        return report
+    }
+
+    private func decodeInstallReport(_ output: String) throws -> InstallReport {
+        guard let report = try? JSONDecoder().decode(InstallReport.self, from: Data(output.utf8)),
+              report.command == "install" else {
+            throw GUIError("命令行工具返回了无法解析的安装检查结果。")
+        }
+        try requireSupportedSchema(report.schemaVersion)
+        return report
+    }
+
+    private func requireSupportedSchema(_ schemaVersion: Int) throws {
+        guard schemaVersion == GUICLIProtocol.schemaVersion else {
+            throw GUIError(
+                "命令行接口版本不兼容（GUI 支持 \(GUICLIProtocol.schemaVersion)，工具返回 \(schemaVersion)）。")
+        }
+    }
+
+    private func commandFailureMessage(_ result: CLIResult, operation: String) -> String {
+        let detail = (result.stderr + "\n" + result.output)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return detail.isEmpty
+            ? "\(operation)失败（退出码 \(result.exitCode)）。"
+            : "\(operation)失败：\(detail)"
     }
 
     // MARK: - Quit WeChat
 
     func quitWeChat() async {
+        guard !busy else { return }
         busy = true
-        busyMessage = "正在退出微信…"
-        await WeChatStatusProbe.quitAll()
-        wechatRunning = WeChatStatusProbe.isRunning()
+        busyMessage = "正在退出所选微信…"
+        await WeChatStatusProbe.quit(appPath: appPath)
+        wechatRunning = WeChatStatusProbe.isRunning(appPath: appPath)
         busy = false
         busyMessage = ""
     }
@@ -182,12 +451,47 @@ final class AppState: ObservableObject {
         return .needsElevation
     }
 
+    /// A real create/remove probe avoids assuming that POSIX mode bits reflect sandbox/TCC access.
+    static func canWriteCloneOutputDirectory(_ path: String) -> Bool {
+        let directory = URL(fileURLWithPath: path).standardizedFileURL
+        var isDirectory = ObjCBool(false)
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return false
+        }
+
+        let probe = directory.appendingPathComponent(".wechat-antirecall-write-probe-\(UUID().uuidString)")
+        do {
+            try Data().write(to: probe, options: .withoutOverwriting)
+            try fm.removeItem(at: probe)
+            return true
+        } catch {
+            try? fm.removeItem(at: probe)
+            return false
+        }
+    }
+
     /// The one-click flow: verify WeChat is quit, dry-run to confirm every byte matches,
     /// then elevate for the real install. Any byte mismatch aborts before touching the app.
     func install(_ request: InstallRequest) async {
         guard !busy else { return }
         banner = nil
         appendLog("——— 开始：\(request.mode.title) ———")
+        if customTipNeedsRestore {
+            banner = Banner(
+                kind: .warning,
+                title: "请先恢复自定义提示状态",
+                message: "检测到不完整或混合的自定义提示运行时状态。在还原对应备份前，不能安装或检查任何模式，以免再次备份或重签名这个残留状态。")
+            return
+        }
+        guard isInstallModeAvailable(request.mode) else {
+            banner = Banner(
+                kind: .warning,
+                title: "当前模式不可用",
+                message: "所选微信版本没有完整提供「\(request.mode.title)」所需的补丁能力。请勿继续安装。")
+            return
+        }
 
         // A custom-tip install changes additional bytes and injects a runtime dylib. Applying
         // only the silent branch patch on top would leave those pieces behind and create a mixed
@@ -200,7 +504,7 @@ final class AppState: ObservableObject {
             return
         }
 
-        if WeChatStatusProbe.isRunning() {
+        if WeChatStatusProbe.isRunning(appPath: appPath) {
             banner = Banner(kind: .warning, title: "请先退出微信", message: "安装前需要完全退出微信，避免签名失效导致崩溃。")
             return
         }
@@ -224,19 +528,29 @@ final class AppState: ObservableObject {
             appendLog("检查失败：\(message)")
             return
         }
-        if let report = try? JSONDecoder().decode(InstallReport.self, from: Data(dry.output.utf8)) {
-            if !report.allEntriesClean {
-                banner = Banner(kind: .error, title: "补丁点不匹配", message: "当前微信的字节与补丁不符，可能版本数据过旧。请到「更新」页拉取最新补丁数据后重试。")
-                return
+        let report: InstallReport
+        do {
+            report = try decodeInstallReport(dry.output)
+        } catch {
+            banner = Banner(kind: .error, title: "检查结果不可用", message: error.localizedDescription)
+            appendLog("检查结果无效：\(error.localizedDescription)")
+            return
+        }
+        switch InstallPreflightDisposition.classify(report) {
+        case .invalid:
+            banner = Banner(kind: .error, title: "检查结果无效", message: "安装检查没有返回有效步骤，或包含无法安全继续的状态。请先查看日志并还原对应备份。")
+            return
+        case .alreadyInstalled:
+            banner = Banner(kind: .info, title: "已经开启", message: "\(request.mode.title)已经在生效中，无需重复安装。")
+            if request.mode != .updateOnly {
+                installState = .installed
+                installedMode = request.mode
+            } else {
+                updateBlockState = .installed
             }
-            if report.alreadyApplied {
-                banner = Banner(kind: .info, title: "已经开启", message: "\(request.mode.title)已经在生效中，无需重复安装。")
-                if request.mode != .updateOnly {
-                    installState = .installed
-                    installedMode = request.mode
-                }
-                return
-            }
+            return
+        case .installable:
+            break
         }
 
         // 2) Real install. The real install emits progress; keep --json off the human log so
@@ -275,7 +589,7 @@ final class AppState: ObservableObject {
         if real.succeeded {
             banner = Banner(kind: .success, title: "\(request.mode.title) 已开启",
                             message: "请完全退出并重新打开微信。首次使用建议用另一账号发消息再撤回，验证效果。")
-            await refresh()
+            await refresh(preserveBanner: true)
         } else {
             let message = friendlyFailure(real)
             banner = Banner(kind: .error, title: "安装失败", message: message)
@@ -287,6 +601,20 @@ final class AppState: ObservableObject {
     func checkOnly(_ request: InstallRequest) async {
         guard !busy else { return }
         banner = nil
+        if customTipNeedsRestore {
+            banner = Banner(
+                kind: .warning,
+                title: "请先恢复自定义提示状态",
+                message: "检测到不完整或混合的自定义提示运行时状态。在还原对应备份前，不能检查或安装任何模式。")
+            return
+        }
+        guard isInstallModeAvailable(request.mode) else {
+            banner = Banner(
+                kind: .warning,
+                title: "当前模式不可用",
+                message: "所选微信版本没有完整提供「\(request.mode.title)」所需的补丁能力。")
+            return
+        }
         busy = true
         busyMessage = "正在检查补丁点…"
         defer { busy = false; busyMessage = "" }
@@ -300,14 +628,18 @@ final class AppState: ObservableObject {
             banner = Banner(kind: .error, title: "检查未通过", message: decodeErrorMessage(from: result) ?? "补丁点检查失败。")
             return
         }
-        if let report = try? JSONDecoder().decode(InstallReport.self, from: Data(result.output.utf8)) {
-            if !report.allEntriesClean {
-                banner = Banner(kind: .error, title: "补丁点不匹配", message: "字节与补丁不符，请先到「检查更新」拉取最新补丁数据。")
-            } else if report.alreadyApplied {
+        do {
+            let report = try decodeInstallReport(result.output)
+            switch InstallPreflightDisposition.classify(report) {
+            case .invalid:
+                banner = Banner(kind: .error, title: "检查结果无效", message: "安装检查没有返回有效步骤，或包含无法安全继续的状态。请查看日志并先还原对应备份。")
+            case .alreadyInstalled:
                 banner = Banner(kind: .info, title: "已经安装", message: "这些补丁已经在生效中。")
-            } else {
-                banner = Banner(kind: .success, title: "检查通过", message: "所有补丁点匹配，可以安全安装。")
+            case .installable:
+                banner = Banner(kind: .success, title: "检查通过", message: "现有步骤与待应用步骤兼容，可以安全安装剩余修改。")
             }
+        } catch {
+            banner = Banner(kind: .error, title: "检查结果不可用", message: error.localizedDescription)
         }
     }
 
@@ -316,7 +648,7 @@ final class AppState: ObservableObject {
     func restore(session: BackupSession) async {
         guard !busy else { return }
         banner = nil
-        if WeChatStatusProbe.isRunning() {
+        if WeChatStatusProbe.isRunning(appPath: appPath) {
             banner = Banner(kind: .warning, title: "请先退出微信", message: "恢复前需要完全退出微信。")
             return
         }
@@ -357,7 +689,7 @@ final class AppState: ObservableObject {
             banner = Banner(kind: .error, title: "恢复失败", message: failure)
         } else {
             banner = Banner(kind: .success, title: "已恢复", message: "已从备份还原。请完全退出并重新打开微信。")
-            await refresh()
+            await refresh(preserveBanner: true)
         }
     }
 
@@ -388,13 +720,22 @@ final class AppState: ObservableObject {
             return
         }
 
-        // 2) Real clone (elevated — writes to /Applications).
-        busyMessage = "正在创建副本（需要管理员密码）…"
+        // 2) Write directly when the selected directory really is writable; otherwise retain
+        // the administrator path required for root-owned locations such as /Applications.
+        let writableAsUser = Self.canWriteCloneOutputDirectory(outputDir)
+        busyMessage = writableAsUser ? "正在创建副本…" : "正在创建副本（需要管理员密码）…"
         var realArgs = baseArgs(dryRun: false)
         realArgs.removeAll { $0 == "--json" }
-        let real = await CLIRunner.runAdmin(BundledPaths.cli, realArgs, operation: "clone", onLine: { [weak self] line in
-            Task { @MainActor in self?.appendLog(line) }
-        })
+        let real: CLIResult
+        if writableAsUser {
+            real = await CLIRunner.runUser(BundledPaths.cli, realArgs, onLine: { [weak self] line in
+                Task { @MainActor in self?.appendLog(line) }
+            })
+        } else {
+            real = await CLIRunner.runAdmin(BundledPaths.cli, realArgs, operation: "clone", onLine: { [weak self] line in
+                Task { @MainActor in self?.appendLog(line) }
+            })
+        }
         if real.cancelled {
             banner = Banner(kind: .info, title: "已取消", message: "你取消了管理员授权。")
         } else if real.succeeded {
@@ -418,12 +759,18 @@ final class AppState: ObservableObject {
             appendLog("已更新补丁数据：\(result.count) 个构建号（\(result.checksumVerified ? "校验和已验证" : "仅结构校验")）")
             await refresh()
             let verifyNote = result.checksumVerified ? "" : "（未找到校验和文件，已仅按结构校验）"
-            if case .supported = supportStatus {
+            switch supportStatus {
+            case .supported:
                 banner = Banner(kind: .success, title: "补丁数据已更新",
                                 message: "现在已支持你的微信版本，可以开启防撤回了。\(verifyNote)")
-            } else {
+            case .unsupported:
                 banner = Banner(kind: .info, title: "补丁数据已更新",
                                 message: "已拉取最新数据（\(result.count) 个构建号），但仍未包含当前微信版本 \(displayBuild)。可能上游尚未适配，请稍后再试或到项目页反馈。")
+            case .noWeChat:
+                banner = Banner(kind: .info, title: "补丁数据已更新",
+                                message: "已拉取最新数据（\(result.count) 个构建号）。选择或安装官方微信后即可检测支持状态。")
+            case .failed, .unknown:
+                break
             }
         } catch {
             banner = Banner(kind: .error, title: "更新失败", message: error.localizedDescription)
@@ -446,14 +793,16 @@ final class AppState: ObservableObject {
         busyMessage = "正在从源码构建…"
         defer { busy = false; busyMessage = "" }
         do {
-            let outcome = try await SourceBuildService.buildFromSource(onLine: { [weak self] line in
+            let outcome = try await SourceBuildService.buildFromSource(appPath: appPath, onLine: { [weak self] line in
                 Task { @MainActor in self?.appendLog(line) }
             })
-            usingBuiltFromSource = true
+            usingBuiltFromSource = BundledPaths.usingBuiltFromSource
             await refresh()
+            guard supportStatus != .failed else { return }
             banner = Banner(kind: .success, title: "已切换到源码构建",
                             message: "已用最新源码编译的工具（commit \(outcome.commit)）。以后的操作都会用它。")
         } catch {
+            usingBuiltFromSource = BundledPaths.usingBuiltFromSource
             banner = Banner(kind: .error, title: "构建失败", message: error.localizedDescription)
         }
     }
@@ -461,10 +810,12 @@ final class AppState: ObservableObject {
     func revertSourceBuild() async {
         do {
             try SourceBuildService.revertToBundled()
-            usingBuiltFromSource = false
+            usingBuiltFromSource = BundledPaths.usingBuiltFromSource
             await refresh()
+            guard supportStatus != .failed else { return }
             banner = Banner(kind: .info, title: "已回退", message: "已改用 App 内置的工具。")
         } catch {
+            usingBuiltFromSource = BundledPaths.usingBuiltFromSource
             banner = Banner(kind: .error, title: "回退失败", message: error.localizedDescription)
         }
     }
@@ -473,6 +824,7 @@ final class AppState: ObservableObject {
         do {
             try UpdateService.revertToBundled()
             await refresh()
+            guard supportStatus != .failed else { return }
             banner = Banner(kind: .info, title: "已回退", message: "已改用 App 内置的补丁数据。")
         } catch {
             banner = Banner(kind: .error, title: "回退失败", message: error.localizedDescription)
@@ -491,10 +843,16 @@ final class AppState: ObservableObject {
     func clearLog() { logLines.removeAll() }
 
     private func decodeErrorMessage(from result: CLIResult) -> String? {
-        if let env = try? JSONDecoder().decode(CLIErrorEnvelope.self, from: Data(result.output.utf8)) {
-            return env.error.message
+        guard let envelope = try? JSONDecoder().decode(
+            CLIErrorEnvelope.self,
+            from: Data(result.output.utf8)
+        ) else {
+            return nil
         }
-        return nil
+        guard envelope.schemaVersion == GUICLIProtocol.schemaVersion else {
+            return "命令行接口版本不兼容（GUI 支持 \(GUICLIProtocol.schemaVersion)，工具返回 \(envelope.schemaVersion)）。"
+        }
+        return envelope.error.message
     }
 
     private func friendlyFailure(_ result: CLIResult) -> String {
@@ -506,8 +864,11 @@ final class AppState: ObservableObject {
         if log.contains("仍在运行") || log.contains("appIsRunning") {
             return "微信仍在运行，请完全退出后重试。"
         }
-        if let env = try? JSONDecoder().decode(CLIErrorEnvelope.self, from: Data(log.utf8)) {
-            return env.error.message
+        if let envelope = try? JSONDecoder().decode(CLIErrorEnvelope.self, from: Data(log.utf8)) {
+            guard envelope.schemaVersion == GUICLIProtocol.schemaVersion else {
+                return "命令行接口版本不兼容（GUI 支持 \(GUICLIProtocol.schemaVersion)，工具返回 \(envelope.schemaVersion)）。"
+            }
+            return envelope.error.message
         }
         let tail = log.split(separator: "\n").suffix(4).joined(separator: "\n")
         return tail.isEmpty ? "操作失败（退出码 \(result.exitCode)）。可在下方日志查看详情。" : tail

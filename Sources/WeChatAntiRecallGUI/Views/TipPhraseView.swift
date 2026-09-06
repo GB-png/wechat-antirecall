@@ -5,6 +5,7 @@ struct TipPhraseView: View {
     @EnvironmentObject var state: AppState
     @StateObject private var controller = TipPhraseController()
     @State private var debounce: Task<Void, Never>?
+    @State private var loadedTargetPath: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.gap) {
@@ -14,39 +15,39 @@ struct TipPhraseView: View {
                 BannerView(banner: banner)
             }
 
-            if !state.runtimeTipSupported {
-                Card {
-                    HintRow(systemImage: "exclamationmark.triangle",
-                            text: "当前微信版本不支持自定义提示（需要新的应用更新）。你仍可编辑短语，但要在支持的版本上安装「自定义提示」模式后才会生效。",
-                            tint: .orange)
-                }
-            }
+            availabilityNotice
 
-            if let loadError = controller.loadError {
-                Card {
-                    VStack(alignment: .leading, spacing: 10) {
-                        HintRow(
-                            systemImage: "lock.trianglebadge.exclamationmark",
-                            text: loadError,
-                            tint: .orange)
-                        Button {
-                            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
-                                NSWorkspace.shared.open(url)
+            if targetReadyForPreferences {
+                if let loadError = controller.loadError {
+                    Card {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HintRow(
+                                systemImage: "lock.trianglebadge.exclamationmark",
+                                text: loadError,
+                                tint: .orange)
+                            Button {
+                                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+                                    NSWorkspace.shared.open(url)
+                                }
+                            } label: {
+                                Label("打开完全磁盘访问设置", systemImage: "arrow.up.forward.app")
                             }
-                        } label: {
-                            Label("打开完全磁盘访问设置", systemImage: "arrow.up.forward.app")
+                            .buttonStyle(.bordered)
                         }
-                        .buttonStyle(.bordered)
                     }
                 }
-            }
 
-            editorCard
-            previewCard
-            installCard
-            probeCard
+                editorCard
+                previewCard
+                if case .supported = state.supportStatus {
+                    installCard
+                }
+                probeCard
+            }
         }
-        .onAppear { Task { await controller.load() } }
+        .onAppear(perform: reloadTargetIfReady)
+        .onChange(of: state.appPath) { _ in reloadTargetIfReady() }
+        .onChange(of: state.supportStatus) { _ in reloadTargetIfReady() }
     }
 
     private var editorCard: some View {
@@ -80,18 +81,15 @@ struct TipPhraseView: View {
                 }
 
                 HStack {
-                    Button("仅保存") { Task { await controller.save() } }
+                    Button("仅保存") { Task { await controller.save(appPath: state.appPath) } }
                         .buttonStyle(.bordered)
                         .disabled(controller.busy)
-                    Button("恢复默认") { Task { await controller.reset() } }
+                    Button("恢复默认") { Task { await controller.reset(appPath: state.appPath) } }
                         .buttonStyle(.bordered)
                         .disabled(controller.busy)
                     if controller.busy { ProgressView().controlSize(.small) }
                 }
-                HintRow(systemImage: "info.circle",
-                        text: customTipInstalled
-                            ? "运行时已安装；保存后完全退出并重开微信即可生效。"
-                            : "可在下方一次完成「保存短语 + 安装运行时」，无需再跳到高级安装。")
+                HintRow(systemImage: "info.circle", text: editorHintText)
             }
         }
     }
@@ -150,7 +148,7 @@ struct TipPhraseView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .tint(Theme.accent)
-                .disabled(controller.busy || state.busy || !state.runtimeTipSupported || (state.wechatRunning && !customTipInstalled))
+                .disabled(controller.busy || state.busy || !state.customTipAvailable || (state.wechatRunning && !customTipInstalled))
             }
         }
     }
@@ -160,7 +158,7 @@ struct TipPhraseView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Toggle(isOn: Binding(
                     get: { controller.probeEnabled },
-                    set: { newValue in Task { await controller.setProbe(newValue) } }
+                    set: { newValue in Task { await controller.setProbe(newValue, appPath: state.appPath) } }
                 )) {
                     VStack(alignment: .leading, spacing: 1) {
                         Text("调试探针")
@@ -199,12 +197,81 @@ struct TipPhraseView: View {
         }
     }
 
+    @ViewBuilder
+    private var availabilityNotice: some View {
+        switch state.supportStatus {
+        case .unknown:
+            Card {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("正在检测所选微信…").font(.callout).foregroundStyle(.secondary)
+                }
+            }
+        case .noWeChat:
+            Card {
+                HintRow(
+                    systemImage: "questionmark.app",
+                    text: "没有找到所选微信 App。请先回到首页选择已安装的官方 macOS 微信。",
+                    tint: .orange)
+            }
+        case .failed:
+            Card {
+                HintRow(
+                    systemImage: "exclamationmark.triangle",
+                    text: "所选微信检测失败。请先按上方错误提示修复或回到首页重新选择。",
+                    tint: .red)
+            }
+        case .unsupported(let build):
+            Card {
+                HintRow(
+                    systemImage: "exclamationmark.triangle",
+                    text: "当前构建号 \(build) 尚未包含在补丁数据中。你可以保存该微信的短语，但暂不能安装自定义提示；请先拉取最新补丁数据或等待适配。",
+                    tint: .orange)
+            }
+        case .supported:
+            if !state.customTipAvailable {
+                Card {
+                    HintRow(
+                        systemImage: "exclamationmark.triangle",
+                        text: "当前构建虽已识别，但未同时提供自定义提示所需的运行时和提示补丁。你仍可保存短语，安装按钮会保持不可用。",
+                        tint: .orange)
+                }
+            }
+        }
+    }
+
+    private var targetReadyForPreferences: Bool {
+        switch state.supportStatus {
+        case .supported, .unsupported:
+            return true
+        case .unknown, .noWeChat, .failed:
+            return false
+        }
+    }
+
+    private func reloadTargetIfReady() {
+        let targetPath = state.appPath
+        guard targetReadyForPreferences, loadedTargetPath != targetPath else { return }
+        loadedTargetPath = targetPath
+        Task { await controller.load(appPath: targetPath) }
+    }
+    private var editorHintText: String {
+        if customTipInstalled {
+            return "运行时已安装；保存后完全退出并重开微信即可生效。"
+        }
+        if state.customTipAvailable {
+            return "可在下方一次完成「保存短语 + 安装运行时」，无需再跳到高级安装。"
+        }
+        return "短语会保存到当前微信的配置；此构建目前不能安装自定义提示，页面不会执行补丁或签名操作。"
+    }
+
+
     private var customTipInstalled: Bool {
         state.installState == .installed && state.installedMode == .customTip
     }
 
     private func saveAndApply() async {
-        guard await controller.save() else { return }
+        guard await controller.save(appPath: state.appPath) else { return }
         if customTipInstalled {
             state.banner = Banner(
                 kind: .success,
