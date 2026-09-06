@@ -92,6 +92,14 @@ int wechat_antirecall_inline_hook_selftest(void);
 // Verifies that the trampoline preserves NZCV before jumping to the original b.eq.
 int wechat_antirecall_message_capture_inline_hook_selftest(void);
 
+// Offline checks: these never look up a WeChat service or send a request.
+const char *wechat_antirecall_red_packet_runtime_version(void);
+int wechat_antirecall_red_packet_parse(const char *xml);
+int wechat_antirecall_red_packet_can_open(int code, int sender, int received, int status, int type, const char *timing);
+int wechat_antirecall_red_packet_fresh(uint64_t created, uint64_t activated, uint64_t now);
+int wechat_antirecall_red_packet_policy_selftest(void);
+int wechat_antirecall_red_packet_native_abi_selftest(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -474,7 +474,7 @@ final class AppState: ObservableObject {
 
     /// The one-click flow: verify WeChat is quit, dry-run to confirm every byte matches,
     /// then elevate for the real install. Any byte mismatch aborts before touching the app.
-    func install(_ request: InstallRequest) async {
+    func install(_ request: InstallRequest, refreshRuntime: Bool = false) async {
         guard !busy else { return }
         banner = nil
         appendLog("——— 开始：\(request.mode.title) ———")
@@ -541,6 +541,9 @@ final class AppState: ObservableObject {
             banner = Banner(kind: .error, title: "检查结果无效", message: "安装检查没有返回有效步骤，或包含无法安全继续的状态。请先查看日志并还原对应备份。")
             return
         case .alreadyInstalled:
+            // The loader/patches may be current while the bundled runtime predates
+            // a new feature. The explicit runtime-update action must replace it.
+            if refreshRuntime && request.mode == .customTip { break }
             banner = Banner(kind: .info, title: "已经开启", message: "\(request.mode.title)已经在生效中，无需重复安装。")
             if request.mode != .updateOnly {
                 installState = .installed

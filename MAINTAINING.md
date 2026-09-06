@@ -4,6 +4,8 @@
 
 用户向的使用说明在 [README.md](README.md)。
 
+实验性自动红包的协议、对象布局与 ABI 证据见 [269624 红包逆向记录](Docs/red-packet-269624.md)。该功能复用已有消息 finalizer hook，默认关闭；适配范围独立于防撤回构建表。
+
 ---
 
 ## patches.json 结构

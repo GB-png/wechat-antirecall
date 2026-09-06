@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "WeChatAntiRecallRuntime.h"
+#include "RedPacketInternal.h"
 
 namespace {
 
@@ -1643,6 +1644,8 @@ void hookedFinalizeMessage(void *message, int mode) {
     // point, while later handlers may normalize or replace the raw content.
     captureReceivedContentPreview(message, activeMessageCaptureHookConfig);
     originalFinalizeMessage(message, mode);
+    // The payment extension exists only after the original finalizer has parsed it.
+    wechat_antirecall_red_packet_observe(message, mode);
 }
 
 struct WeChatDylibImage {
@@ -1993,6 +1996,9 @@ void installRevokeTipHook() {
 
     if (const auto *captureConfig = inlineMessageCaptureHookConfigForBuild(buildVersion.c_str())) {
         installMessageCaptureInlineHook(image, captureConfig);
+        if (originalFinalizeMessage != nullptr) {
+            wechat_antirecall_red_packet_initialize(image.slide, buildVersion.c_str());
+        }
     }
 }
 
