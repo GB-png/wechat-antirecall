@@ -108,7 +108,7 @@ std::optional<Packet> parse(const std::string &raw) {
 }
 
 bool canOpen(int retcode, bool sender, int received, int status, int type, bool hasTiming) {
-    // PayRedEnvelopeCoverViewModel, build 269624, sub_126FAE4.
+    // PayRedEnvelopeCoverViewModel: 269624 sub_126FAE4 / 269628 sub_126F6B4.
     return retcode == 0 && !sender && received == 0 && (status == 2 || status == 3) &&
         (type == 0 || type == 1 || type == 3) && hasTiming;
 }
@@ -181,35 +181,89 @@ static_assert(sizeof(NativeTask) == 56 && offsetof(NativeTask, weak) == 32);
 static_assert(sizeof(Subscription) == 40 && offsetof(Subscription, receiver) == 8 && offsetof(Subscription, auxiliary) == 24);
 static_assert(sizeof(SourceLocation) == 32);
 
+struct Profile {
+    const char *build;
+    uintptr_t textLo;
+    uintptr_t textHi;
+    uintptr_t messageToDisplay;
+    uintptr_t displayDestroy;
+    uintptr_t appContext;
+    uintptr_t getService;
+    uintptr_t receiveService;
+    uintptr_t openService;
+    uintptr_t subscribe;
+    uintptr_t serviceDescriptor;
+    uintptr_t rttiBase;
+    uintptr_t rttiReceive;
+    uintptr_t rttiOpen;
+    uintptr_t messageVtable;
+    struct Check { uintptr_t ea; uint32_t words[3]; } checks[9];
+};
+
+constexpr Profile kProfiles[] = {
+    {
+        "269624", 0x19000, 0x6d8f06c,
+        0x494e760, 0x38bc54, 0x4316f84, 0x421e59c,
+        0x40dd2cc, 0x40dd2d4, 0x4ddea0,
+        0x97640d0, 0x9768eb8, 0x99b8d38, 0x99b8db8, 0x99eb1a0,
+        {
+            {0x494e760, {0xd101c3ff, 0xa9035ff8, 0xa90457f6}},
+            {0x38bc54, {0xa9be4ff4, 0xa9017bfd, 0x910043fd}},
+            {0x4316f84, {0xb002e2e8, 0xf9404500, 0xd65f03c0}},
+            {0x421e59c, {0xd107c3ff, 0xa91a67fa, 0xa91b5ff8}},
+            {0x40dd2cc, {0xf9401c00, 0x17ff82cc, 0xf9401c00}},
+            {0x40dd2d4, {0xf9401c00, 0x17ff83c9, 0xf9401c00}},
+            {0x4ddea0, {0xd10303ff, 0xa9085ff8, 0xa90957f6}},
+            {0x40d65c8, {0xd10503ff, 0xa90f67fa, 0xa9105ff8}},
+            {0x40d5dd8, {0xa9bc6ffc, 0xa90157f6, 0xa9024ff4}},
+        },
+    },
+    {
+        "269628", 0x18000, 0x6d930b0,
+        0x494fa28, 0x38ac74, 0x4317c9c, 0x421f2b4,
+        0x40ddfe4, 0x40ddfec, 0x4e181c,
+        0x97680d8, 0x976cec0, 0x99bcd38, 0x99bcdb8, 0x99ef1a0,
+        {
+            {0x494fa28, {0xd101c3ff, 0xa9035ff8, 0xa90457f6}},
+            {0x38ac74, {0xa9be4ff4, 0xa9017bfd, 0x910043fd}},
+            {0x4317c9c, {0x9002e308, 0xf940ed00, 0xd65f03c0}},
+            {0x421f2b4, {0xd107c3ff, 0xa91a67fa, 0xa91b5ff8}},
+            {0x40ddfe4, {0xf9401c00, 0x17ff82cc, 0xf9401c00}},
+            {0x40ddfec, {0xf9401c00, 0x17ff83c9, 0xf9401c00}},
+            {0x4e181c, {0xd10303ff, 0xa9085ff8, 0xa90957f6}},
+            {0x40d72e0, {0xd10503ff, 0xa90f67fa, 0xa9105ff8}},
+            {0x40d6af0, {0xa9bc6ffc, 0xa90157f6, 0xa9024ff4}},
+        },
+    },
+};
+
+const Profile *profileForBuild(const char *build) {
+    if (!build) return nullptr;
+    for (const auto &profile : kProfiles) {
+        if (std::strcmp(build, profile.build) == 0) return &profile;
+    }
+    return nullptr;
+}
+
 struct Api {
-    uintptr_t slide;
+    const Profile *profile = nullptr;
+    uintptr_t slide = 0;
     uintptr_t at(uintptr_t ea) const { return slide + ea; }
     bool valid() const {
-        struct Check { uintptr_t ea; uint32_t words[3]; };
-        const Check checks[] = {
-            {0x494e760,{0xd101c3ff,0xa9035ff8,0xa90457f6}},
-            {0x38bc54,{0xa9be4ff4,0xa9017bfd,0x910043fd}},
-            {0x4316f84,{0xb002e2e8,0xf9404500,0xd65f03c0}},
-            {0x421e59c,{0xd107c3ff,0xa91a67fa,0xa91b5ff8}},
-            {0x40dd2cc,{0xf9401c00,0x17ff82cc,0xf9401c00}},
-            {0x40dd2d4,{0xf9401c00,0x17ff83c9,0xf9401c00}},
-            {0x4ddea0,{0xd10303ff,0xa9085ff8,0xa90957f6}},
-            {0x40d65c8,{0xd10503ff,0xa90f67fa,0xa9105ff8}},
-            {0x40d5dd8,{0xa9bc6ffc,0xa90157f6,0xa9024ff4}}
-        };
-        for (const auto &check : checks) {
+        if (!profile) return false;
+        for (const auto &check : profile->checks) {
             auto p = reinterpret_cast<void *>(at(check.ea));
             if (!readable(p, sizeof(check.words)) || std::memcmp(p, check.words, sizeof(check.words))) return false;
         }
         return true;
     }
-    void *context() const { return reinterpret_cast<void *(*)()>(at(0x4316f84))(); }
+    void *context() const { return reinterpret_cast<void *(*)()>(at(profile->appContext))(); }
     uintptr_t method(void *object, size_t offset) const {
         if (!readable(object, sizeof(uintptr_t))) return 0;
         const auto table = field<uintptr_t>(object, 0);
         if (!readable(reinterpret_cast<void *>(table + offset), sizeof(uintptr_t))) return 0;
         const auto fn = field<uintptr_t>(reinterpret_cast<void *>(table), offset);
-        return fn >= slide + 0x19000 && fn < slide + 0x6d8f06c ? fn : 0;
+        return fn >= slide + profile->textLo && fn < slide + profile->textHi ? fn : 0;
     }
     std::string account() const {
         void *ctx = context();
@@ -228,16 +282,16 @@ struct Api {
         if (!fn) return {};
         sret(fn, &center, accountContext.get());
         if (!center) return {};
-        uintptr_t descriptor = at(0x97640d0);
-        sret(at(0x421e59c), &result, center.get(), &descriptor);
+        uintptr_t descriptor = at(profile->serviceDescriptor);
+        sret(at(profile->getService), &result, center.get(), &descriptor);
         return result;
     }
     void *response(const std::shared_ptr<void> &value, bool opening) const {
         using Cast = void *(*)(const void *, const void *, const void *, ptrdiff_t);
         static auto cast = reinterpret_cast<Cast>(dlsym(RTLD_DEFAULT, "__dynamic_cast"));
         if (!cast || !readable(value.get(), sizeof(uintptr_t))) return nullptr;
-        return cast(value.get(), reinterpret_cast<void *>(at(0x9768eb8)),
-                    reinterpret_cast<void *>(at(opening ? 0x99b8db8 : 0x99b8d38)), 0);
+        return cast(value.get(), reinterpret_cast<void *>(at(profile->rttiBase)),
+                    reinterpret_cast<void *>(at(opening ? profile->rttiOpen : profile->rttiReceive)), 0);
     }
 };
 
@@ -328,7 +382,8 @@ public:
     void request(const std::shared_ptr<Attempt> &a, bool opening, const std::string &timing) {
         Api *api = activeApi.load();
         NativeTask task;
-        sret(api->at(opening ? 0x40dd2d4 : 0x40dd2cc), &task, a->service.get(), a->model->bytes, opening ? &timing : nullptr);
+        sret(api->at(opening ? api->profile->openService : api->profile->receiveService),
+             &task, a->service.get(), a->model->bytes, opening ? &timing : nullptr);
         std::function<void(const std::shared_ptr<void> &)> success = [a, opening](const std::shared_ptr<void> &response) {
             // Retain the reply across the dispatch; the original callback owns it only during this call.
             auto held = response;
@@ -337,7 +392,7 @@ public:
         std::function<void()> error, complete;
         const SourceLocation location{"WeChatAntiRecallRedPacket", "RedPacket.mm", 1, 0};
         Subscription subscription;
-        sret(api->at(0x4ddea0), &subscription, &task, &success, &error, &complete, &location);
+        sret(api->at(api->profile->subscribe), &subscription, &task, &success, &error, &complete, &location);
         a->subscription = std::move(subscription);
     }
     void reply(const std::shared_ptr<Attempt> &a, const std::shared_ptr<void> &value, bool opening) {
@@ -379,8 +434,11 @@ public:
 
 void wechat_antirecall_red_packet_initialize(uintptr_t slide, const char *build) {
 #if defined(__arm64__)
-    if (!build || std::strcmp(build, "269624") || red_packet::activeApi.load()) return;
-    auto api = std::make_unique<red_packet::Api>(); api->slide = slide;
+    const auto *profile = red_packet::profileForBuild(build);
+    if (!profile || red_packet::activeApi.load()) return;
+    auto api = std::make_unique<red_packet::Api>();
+    api->profile = profile;
+    api->slide = slide;
     if (!api->valid()) {
         os_log_error(OS_LOG_DEFAULT, "[WeChatAntiRecall] red-packet: binary profile mismatch");
         return;
@@ -395,7 +453,7 @@ void wechat_antirecall_red_packet_observe(void *message, int mode) {
     using namespace red_packet;
     Api *api = activeApi.load();
     if (!api || !enabled.load() || mode != 1 || !readable(message, 632) ||
-        field<uintptr_t>(message, 0) != api->at(0x99eb1a0) || field<uint32_t>(message, 12) != 49) return;
+        field<uintptr_t>(message, 0) != api->at(api->profile->messageVtable) || field<uint32_t>(message, 12) != 49) return;
     const auto created = field<uint32_t>(message, 276);
     if (!fresh(created, activated.load(), static_cast<uint64_t>(std::time(nullptr)))) return;
     bool reserved = false;
@@ -411,8 +469,8 @@ void wechat_antirecall_red_packet_observe(void *message, int mode) {
         auto a = std::make_shared<Attempt>();
         a->packet = std::move(*packet); a->created = created; a->from = *from; a->to = *to;
         a->model = std::make_shared<DisplayModel>();
-        a->model->destroy = api->at(0x38bc54);
-        sret(api->at(0x494e760), a->model->bytes, message);
+        a->model->destroy = api->at(api->profile->displayDestroy);
+        sret(api->at(api->profile->messageToDisplay), a->model->bytes, message);
         a->model->initialized = true;
         dispatch_async(dispatch_get_main_queue(), ^{
             scheduled.fetch_sub(1);
@@ -459,7 +517,7 @@ red_packet::Subscription fakePacketSubscribe(red_packet::NativeTask *task,
 
 extern "C" {
 const char *wechat_antirecall_red_packet_runtime_version(void) {
-    return "WeChatAntiRecallRedPacket:269624:1";
+    return "WeChatAntiRecallRedPacket:2";
 }
 int wechat_antirecall_red_packet_parse(const char *xml) {
     return xml && red_packet::parse(xml).has_value();

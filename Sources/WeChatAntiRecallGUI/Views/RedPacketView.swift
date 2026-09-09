@@ -32,7 +32,7 @@ struct RedPacketView: View {
             Card {
                 VStack(alignment: .leading, spacing: 12) {
                     SectionLabel(text: "当前支持")
-                    Text("微信 4.1.13 · 构建 269624")
+                    Text("微信 4.1.13 · 构建 269624 / 269628")
                     Text("此版本已完成协议静态分析和离线检查，尚未完成真实红包领取验证。")
                         .font(.callout).foregroundStyle(.secondary)
                     if controller.supported && !runtimeInstalled {

@@ -781,7 +781,7 @@ struct CLI {
         var settings = options.enabled == false ? ((try? store.load()) ?? RedPacketSettings()) : try store.load()
         if let enabled = options.enabled {
             if enabled && !RedPacketSettings.supportedBuilds.contains(info.buildVersion) {
-                throw ToolError.usage("自动红包暂仅适配微信构建 269624；当前构建为 \(info.buildVersion)。")
+                throw ToolError.usage("自动红包暂仅适配微信构建 \(RedPacketSettings.supportedBuilds.sorted().joined(separator: "、"))；当前构建为 \(info.buildVersion)。")
             }
             if enabled && !runtimeAvailable {
                 throw ToolError.usage("请先安装或更新包含自动红包功能的自定义提示运行时，再开启此设置。")
@@ -1543,7 +1543,7 @@ struct RuntimeTipInstaller {
     static let installName = "@loader_path/\(dylibFileName)"
     static let hostBinaryPath = "Contents/Resources/wechat.dylib"
     static let destinationDylibPath = "Contents/Resources/\(dylibFileName)"
-    static let supportedBuildVersions = ["268597", "268599", "268601", "268602", "268831", "268849", "268850", "268851", "269077", "269079", "269110", "269332", "269333", "269334", "269338", "269340", "269341", "269574", "269575", "269576", "269577", "269578", "269579", "269619", "269624"]
+    static let supportedBuildVersions = ["268597", "268599", "268601", "268602", "268831", "268849", "268850", "268851", "269077", "269079", "269110", "269332", "269333", "269334", "269338", "269340", "269341", "269574", "269575", "269576", "269577", "269578", "269579", "269619", "269624", "269628"]
 
     let sourceDylibURL: URL
     let destinationDylibURL: URL

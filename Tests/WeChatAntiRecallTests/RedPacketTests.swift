@@ -78,6 +78,12 @@ final class RedPacketTests: XCTestCase {
         #endif
     }
 
+    func testSupportsCurrentRedPacketBuildsAndRuntimeMarker() {
+        XCTAssertEqual(RedPacketSettings.supportedBuilds, Set(["269624", "269628"]))
+        XCTAssertEqual(RedPacketSettings.runtimeMarker, "WeChatAntiRecallRedPacket:2")
+        XCTAssertEqual(String(cString: wechat_antirecall_red_packet_runtime_version()), "WeChatAntiRecallRedPacket:2")
+    }
+
     func testStrictCLIOptions() throws {
         let defaults = try RedPacketOptions(["get", "--json"])
         XCTAssertNil(defaults.enabled)
